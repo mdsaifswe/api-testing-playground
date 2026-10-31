@@ -112,37 +112,88 @@ public class SsrfValidator {
         }
     }
 
-    private void validateAddress(InetAddress address) {
+    /**
+     * Resolves a redirect location against the current URI (supporting relative and absolute locations)
+     * and strictly validates the resulting destination through SSRF policies.
+     *
+     * @param currentUri current request URI
+     * @param location target location from redirect response
+     * @return validated target URI
+     */
+    public URI resolveAndValidateRedirect(URI currentUri, String location) {
+        if (location == null || location.trim().isEmpty()) {
+            throw new SsrfSecurityException("Redirect Location header is empty.");
+        }
+        URI resolved;
+        try {
+            resolved = currentUri.resolve(location.trim());
+        } catch (IllegalArgumentException e) {
+            throw new SsrfSecurityException("Malformed redirect location: " + location);
+        }
+        return validateUrl(resolved.toString());
+    }
+
+    public void validateAddress(InetAddress address) {
+        if (address == null) {
+            throw new SsrfSecurityException("SSRF Blocked: Destination address is null.");
+        }
+
+        byte[] rawBytes = address.getAddress();
         String ip = address.getHostAddress();
 
-        // 1. Cloud metadata
+        // 1. Handle IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
+        if (rawBytes.length == 16 && isIpv4MappedIpv6(rawBytes)) {
+            try {
+                byte[] ipv4Bytes = Arrays.copyOfRange(rawBytes, 12, 16);
+                InetAddress unmapped = InetAddress.getByAddress(ipv4Bytes);
+                validateAddress(unmapped);
+                return;
+            } catch (UnknownHostException ignored) {}
+        }
+
+        // 2. Cloud metadata IP (169.254.169.254)
         if (CLOUD_METADATA_IP.equals(ip)) {
             throw new SsrfSecurityException("SSRF Blocked: Destination resolves to cloud metadata IP: " + ip);
         }
 
-        // 2. Link-local
+        // 3. Link-local (IPv4 169.254.0.0/16 or IPv6 fe80::/10)
         if (address.isLinkLocalAddress()) {
             throw new SsrfSecurityException("SSRF Blocked: Destination is a link-local address: " + ip);
         }
 
-        // 3. Multicast / AnyLocal / Wildcard
-        if (address.isMulticastAddress() || address.isAnyLocalAddress() || "0.0.0.0".equals(ip)) {
+        // 4. Multicast / AnyLocal / Wildcard (0.0.0.0, ::)
+        if (address.isMulticastAddress() || address.isAnyLocalAddress() || "0.0.0.0".equals(ip) || "::".equals(ip) || "0:0:0:0:0:0:0:0".equals(ip)) {
             throw new SsrfSecurityException("SSRF Blocked: Multicast or wildcard IP address prohibited: " + ip);
         }
 
-        // 4. Loopback (127.0.0.0/8 or ::1)
+        // 5. Loopback (IPv4 127.0.0.0/8 or IPv6 ::1)
         if (address.isLoopbackAddress()) {
             if (!properties.isAllowLoopback()) {
-                throw new SsrfSecurityException("SSRF Blocked: Loopback requests (localhost / 127.0.0.1) are prohibited in current security mode.");
+                throw new SsrfSecurityException("SSRF Blocked: Loopback requests (localhost / 127.0.0.1 / ::1) are prohibited in current security mode.");
             }
             return; // allowed when allowLoopback is true
         }
 
-        // 5. Site-local / Private network (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+        // 6. IPv6 Unique Local Addresses (fc00::/7 covering fc00::/8 and fd00::/8)
+        if (rawBytes.length == 16 && (rawBytes[0] & (byte) 0xFE) == (byte) 0xFC) {
+            if (!properties.isAllowPrivateIps()) {
+                throw new SsrfSecurityException("SSRF Blocked: IPv6 Unique Local Address (" + ip + ") is prohibited in current security mode.");
+            }
+        }
+
+        // 7. Site-local / Private network (IPv4 RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16; IPv6 deprecated fec0::/10)
         if (address.isSiteLocalAddress()) {
             if (!properties.isAllowPrivateIps()) {
                 throw new SsrfSecurityException("SSRF Blocked: Private network destination (" + ip + ") is prohibited in current security mode.");
             }
         }
+    }
+
+    private boolean isIpv4MappedIpv6(byte[] bytes) {
+        if (bytes == null || bytes.length != 16) return false;
+        for (int i = 0; i < 10; i++) {
+            if (bytes[i] != 0) return false;
+        }
+        return bytes[10] == (byte) 0xFF && bytes[11] == (byte) 0xFF;
     }
 }

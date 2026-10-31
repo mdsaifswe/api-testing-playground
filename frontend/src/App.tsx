@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AppShell } from './components/layout/AppShell';
 import { RequestBuilder } from './components/request/RequestBuilder';
 import { ResponseViewer } from './components/response/ResponseViewer';
@@ -22,6 +22,7 @@ import {
 } from './types';
 
 export const App: React.FC = () => {
+  const abortControllerRef = useRef<AbortController | null>(null);
   // Request Builder State
   const [method, setMethod] = useState<HttpMethod>('GET');
   const [url, setUrl] = useState<string>('http://localhost:8080/api/v1/echo/get?demo=true');
@@ -103,25 +104,34 @@ export const App: React.FC = () => {
     loadInitialData();
   }, [loadInitialData]);
 
-  // Request Execution
+  // Request Execution & Cancellation
   const handleSend = async () => {
     if (!url.trim()) {
       addToast('warning', 'Please enter a target URL before sending.', 'URL Required');
       return;
     }
 
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setExecutionState('LOADING');
 
     try {
-      const result = await playgroundApi.executeRequest({
-        method,
-        url: url.trim(),
-        queryParams,
-        headers,
-        auth,
-        body,
-        environmentId: activeEnvironment?.id,
-      });
+      const result = await playgroundApi.executeRequest(
+        {
+          method,
+          url: url.trim(),
+          queryParams,
+          headers,
+          auth,
+          body,
+          environmentId: activeEnvironment?.id,
+        },
+        controller.signal
+      );
 
       setResponse(result);
 
@@ -146,6 +156,12 @@ export const App: React.FC = () => {
       const updatedHistory = await playgroundApi.getHistory();
       setHistory(updatedHistory);
     } catch (err: any) {
+      if (err.name === 'CanceledError' || err.name === 'AbortError' || err.code === 'ERR_CANCELED') {
+        setExecutionState('IDLE');
+        addToast('info', 'Request execution was cancelled');
+        return;
+      }
+
       const errorMsg = err.response?.data?.message || err.message || 'Execution error';
       setResponse({
         statusCode: err.response?.status || 500,
@@ -160,7 +176,20 @@ export const App: React.FC = () => {
       });
       setExecutionState('NETWORK_ERROR');
       addToast('error', errorMsg, 'Execution Failed');
+    } finally {
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
     }
+  };
+
+  const handleCancel = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setExecutionState('IDLE');
+    addToast('info', 'Request execution cancelled');
   };
 
   // Reset Builder
@@ -451,6 +480,7 @@ export const App: React.FC = () => {
           setBody={setBody}
           executionState={executionState}
           onSend={handleSend}
+          onCancel={handleCancel}
           onSave={() => setIsSaveModalOpen(true)}
           onCopyCurl={handleCopyCurl}
           onReset={handleReset}

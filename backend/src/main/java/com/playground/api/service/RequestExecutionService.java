@@ -1,7 +1,10 @@
 package com.playground.api.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.playground.api.config.PlaygroundSecurityProperties;
 import com.playground.api.dto.common.AuthDto;
 import com.playground.api.dto.common.KeyValueDto;
@@ -11,6 +14,7 @@ import com.playground.api.entity.RequestHistoryEntity;
 import com.playground.api.exception.InvalidRequestException;
 import com.playground.api.exception.SsrfSecurityException;
 import com.playground.api.repository.RequestHistoryRepository;
+import com.playground.api.security.SafeDnsResolver;
 import com.playground.api.security.SsrfValidator;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -19,6 +23,8 @@ import org.apache.hc.client5.http.config.RequestConfig;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
 import org.apache.hc.core5.http.Header;
 import org.apache.hc.core5.http.HttpEntity;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
@@ -29,6 +35,8 @@ import org.springframework.stereotype.Service;
 import java.io.IOException;
 import java.net.SocketTimeoutException;
 import java.net.URI;
+import java.net.URLDecoder;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.*;
@@ -39,18 +47,52 @@ import java.util.*;
 public class RequestExecutionService {
 
     private final SsrfValidator ssrfValidator;
+    private final SafeDnsResolver safeDnsResolver;
     private final VariableSubstitutionService substitutionService;
     private final RequestHistoryRepository historyRepository;
     private final PlaygroundSecurityProperties properties;
     private final ObjectMapper objectMapper;
 
+    public static final Set<String> SENSITIVE_PARAM_NAMES = Set.of(
+            "apikey", "api_key", "api-key",
+            "token", "access_token", "refresh_token", "auth_token",
+            "secret", "client_secret",
+            "password", "passwd", "pass", "pwd",
+            "authorization", "credential", "credentials",
+            "key", "auth"
+    );
+
+    public static final Set<String> SENSITIVE_HEADER_NAMES = Set.of(
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "x-api-key",
+            "api-key",
+            "apikey",
+            "x-auth-token",
+            "token",
+            "secret"
+    );
+
+    public static final Set<String> SENSITIVE_JSON_FIELDS = Set.of(
+            "password", "passwd", "pwd",
+            "token", "access_token", "refresh_token", "auth_token",
+            "apikey", "api_key", "api-key",
+            "secret", "client_secret",
+            "authorization", "credential", "credentials", "auth"
+    );
+
     /**
-     * Executes the HTTP request configured by the client, normalizes response, and persists history.
+     * Executes the HTTP request configured by the client, normalizes response, and persists sanitized history.
      */
     public ExecutionResponseDto executeRequest(ExecuteRequestDto requestDto) {
         if (requestDto == null) {
             throw new InvalidRequestException("Execution request payload cannot be null.");
         }
+
+        long startNano = System.nanoTime();
+        long durationMs = 0;
 
         // 1. Resolve environment variables if environment is specified or active
         Long envId = requestDto.getEnvironmentId();
@@ -65,20 +107,25 @@ public class RequestExecutionService {
         try {
             targetUri = ssrfValidator.validateUrl(fullUrl);
         } catch (SsrfSecurityException e) {
-            // Persist security violation to history
+            durationMs = (System.nanoTime() - startNano) / 1_000_000L;
+            log.warn("SSRF security violation blocked for URL {}: {}", redactSensitiveUrl(fullUrl), e.getMessage());
             RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
-                    resolvedBody, 403, "Forbidden", Collections.emptyMap(), e.getMessage(), 0, 0, "SECURITY_VIOLATION");
+                    resolvedBody, 403, "Forbidden", Collections.emptyMap(), e.getMessage(), 0, durationMs, "SECURITY_VIOLATION");
 
             return ExecutionResponseDto.builder()
                     .statusCode(403)
                     .statusText("Forbidden")
+                    .durationMs(durationMs)
+                    .sizeBytes(0)
+                    .headers(Collections.emptyMap())
+                    .body(e.getMessage())
                     .errorCategory("SECURITY_VIOLATION")
                     .errorMessage(e.getMessage())
                     .historyId(history.getId())
                     .build();
         }
 
-        // 4. Configure timeouts
+        // 4. Configure timeouts and disable automatic redirect following (we handle redirects manually with hop-by-hop SSRF validation)
         int timeoutMs = requestDto.getTimeoutMs() != null && requestDto.getTimeoutMs() > 0
                 ? requestDto.getTimeoutMs()
                 : properties.getReadTimeoutMs();
@@ -87,119 +134,238 @@ public class RequestExecutionService {
                 .setConnectTimeout(Timeout.ofMilliseconds(properties.getConnectTimeoutMs()))
                 .setResponseTimeout(Timeout.ofMilliseconds(timeoutMs))
                 .setConnectionRequestTimeout(Timeout.ofMilliseconds(properties.getConnectTimeoutMs()))
-                .setRedirectsEnabled(true)
-                .setMaxRedirects(properties.getMaxRedirects())
+                .setRedirectsEnabled(false) // Strict hop-by-hop manual validation
                 .build();
 
-        long startTime = System.currentTimeMillis();
-        long durationMs = 0;
+        try {
+            PoolingHttpClientConnectionManager connectionManager = PoolingHttpClientConnectionManagerBuilder.create()
+                    .setDnsResolver(safeDnsResolver)
+                    .build();
 
-        try (CloseableHttpClient httpClient = HttpClients.custom()
-                .setDefaultRequestConfig(requestConfig)
-                .build()) {
+            try (CloseableHttpClient httpClient = HttpClients.custom()
+                    .setConnectionManager(connectionManager)
+                    .setDefaultRequestConfig(requestConfig)
+                    .build()) {
 
-            HttpUriRequestBase httpRequest = createHttpRequest(requestDto.getMethod(), targetUri);
+                URI currentUri = targetUri;
+                String currentMethod = requestDto.getMethod();
+                String currentBody = resolvedBody;
+                int redirectCount = 0;
+                Set<URI> visitedUris = new HashSet<>();
+                visitedUris.add(currentUri);
 
-            // Add headers with variable substitution
-            applyHeaders(httpRequest, requestDto.getHeaders(), requestDto.getAuth(), envId);
+                CloseableHttpResponse response = null;
+                try {
+                    while (true) {
+                        HttpUriRequestBase httpRequest = createHttpRequest(currentMethod, currentUri);
 
-            // Apply body for POST, PUT, PATCH, DELETE
-            if (resolvedBody != null && !resolvedBody.trim().isEmpty() && httpRequest.getEntity() == null) {
-                if (isEntityEnclosingMethod(requestDto.getMethod())) {
-                    httpRequest.setEntity(new StringEntity(resolvedBody, StandardCharsets.UTF_8));
-                }
-            }
+                        // Cross-origin check: strip sensitive headers and credentials if redirect destination has a different origin
+                        boolean isCrossOrigin = !isSameOrigin(targetUri, currentUri);
+                        applyHeaders(httpRequest, requestDto.getHeaders(), requestDto.getAuth(), envId, isCrossOrigin);
 
-            try (CloseableHttpResponse response = httpClient.execute(httpRequest)) {
-                durationMs = System.currentTimeMillis() - startTime;
-                int statusCode = response.getCode();
-                String statusText = response.getReasonPhrase() != null ? response.getReasonPhrase() : getStatusText(statusCode);
+                        if (currentBody != null && !currentBody.trim().isEmpty() && httpRequest.getEntity() == null) {
+                            if (isEntityEnclosingMethod(currentMethod)) {
+                                httpRequest.setEntity(new StringEntity(currentBody, StandardCharsets.UTF_8));
+                            }
+                        }
 
-                Map<String, String> responseHeaders = new LinkedHashMap<>();
-                for (Header h : response.getHeaders()) {
-                    responseHeaders.put(h.getName(), h.getValue());
-                }
+                        response = httpClient.execute(httpRequest);
+                        int statusCode = response.getCode();
 
-                String contentType = responseHeaders.getOrDefault("Content-Type", "text/plain");
+                        // Check if response is an HTTP redirect (301, 302, 303, 307, 308)
+                        if (isRedirectStatus(statusCode)) {
+                            Header locationHeader = response.getFirstHeader("Location");
+                            if (locationHeader != null && locationHeader.getValue() != null && !locationHeader.getValue().trim().isEmpty()) {
+                                redirectCount++;
+                                if (redirectCount > properties.getMaxRedirects()) {
+                                    response.close();
+                                    throw new SsrfSecurityException("Maximum redirect limit of " + properties.getMaxRedirects() + " exceeded.");
+                                }
 
-                String responseBody = "";
-                long responseSize = 0;
+                                String locationValue = locationHeader.getValue().trim();
+                                URI nextUri = ssrfValidator.resolveAndValidateRedirect(currentUri, locationValue);
 
-                HttpEntity entity = response.getEntity();
-                if (entity != null) {
-                    byte[] bytes = EntityUtils.toByteArray(entity);
-                    responseSize = bytes.length;
+                                // Block insecure protocol downgrade (e.g. HTTPS to HTTP)
+                                if ("https".equalsIgnoreCase(currentUri.getScheme()) && "http".equalsIgnoreCase(nextUri.getScheme())) {
+                                    response.close();
+                                    throw new SsrfSecurityException("Protocol downgrade from HTTPS to HTTP is prohibited during redirect: " + nextUri);
+                                }
 
-                    // Enforce size limit
-                    if (responseSize > properties.getMaxResponseSizeBytes()) {
-                        responseBody = "[Response payload exceeded limit of " + properties.getMaxResponseSizeBytes() + " bytes]";
-                    } else {
-                        responseBody = new String(bytes, StandardCharsets.UTF_8);
+                                // Prevent redirect loops
+                                if (!visitedUris.add(nextUri)) {
+                                    response.close();
+                                    throw new SsrfSecurityException("Redirect loop detected for URI: " + nextUri);
+                                }
+
+                                // Close response before following the redirect hop
+                                response.close();
+
+                                // Adjust HTTP method according to HTTP specifications
+                                if (statusCode == 303) {
+                                    currentMethod = "GET";
+                                    currentBody = null;
+                                } else if ((statusCode == 301 || statusCode == 302) && isEntityEnclosingMethod(currentMethod)) {
+                                    currentMethod = "GET";
+                                    currentBody = null;
+                                }
+                                // For 307 and 308, currentMethod and currentBody are strictly preserved
+
+                                currentUri = nextUri;
+                                continue;
+                            }
+                        }
+
+                        // Final non-redirect response received
+                        break;
+                    }
+
+                    durationMs = (System.nanoTime() - startNano) / 1_000_000L;
+                    int statusCode = response.getCode();
+                    String statusText = response.getReasonPhrase() != null ? response.getReasonPhrase() : getStatusText(statusCode);
+
+                    Map<String, String> responseHeaders = new LinkedHashMap<>();
+                    for (Header h : response.getHeaders()) {
+                        responseHeaders.put(h.getName(), h.getValue());
+                    }
+
+                    String contentType = responseHeaders.getOrDefault("Content-Type", "text/plain");
+
+                    String responseBody = "";
+                    long responseSize = 0;
+
+                    HttpEntity entity = response.getEntity();
+                    if (entity != null) {
+                        byte[] bytes = EntityUtils.toByteArray(entity);
+                        responseSize = bytes.length;
+
+                        // Enforce size limit
+                        if (responseSize > properties.getMaxResponseSizeBytes()) {
+                            responseBody = "[Response payload exceeded limit of " + properties.getMaxResponseSizeBytes() + " bytes]";
+                        } else {
+                            responseBody = new String(bytes, StandardCharsets.UTF_8);
+                        }
+                    }
+
+                    String errorCategory = (statusCode >= 200 && statusCode < 400) ? "SUCCESS" : "HTTP_ERROR";
+
+                    RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
+                            resolvedBody, statusCode, statusText, responseHeaders, responseBody, responseSize, durationMs, errorCategory);
+
+                    return ExecutionResponseDto.builder()
+                            .statusCode(statusCode)
+                            .statusText(statusText)
+                            .durationMs(durationMs)
+                            .sizeBytes(responseSize)
+                            .headers(responseHeaders)
+                            .body(responseBody)
+                            .contentType(contentType)
+                            .errorCategory(errorCategory)
+                            .historyId(history.getId())
+                            .build();
+
+                } finally {
+                    if (response != null) {
+                        try {
+                            response.close();
+                        } catch (Exception ignored) {}
                     }
                 }
-
-                String errorCategory = (statusCode >= 200 && statusCode < 400) ? "SUCCESS" : "HTTP_ERROR";
-
-                RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
-                        resolvedBody, statusCode, statusText, responseHeaders, responseBody, responseSize, durationMs, errorCategory);
-
-                return ExecutionResponseDto.builder()
-                        .statusCode(statusCode)
-                        .statusText(statusText)
-                        .durationMs(durationMs)
-                        .sizeBytes(responseSize)
-                        .headers(responseHeaders)
-                        .body(responseBody)
-                        .contentType(contentType)
-                        .errorCategory(errorCategory)
-                        .historyId(history.getId())
-                        .build();
-
-            } catch (SocketTimeoutException e) {
-                durationMs = System.currentTimeMillis() - startTime;
-                log.warn("Request timed out after {}ms: {}", durationMs, fullUrl);
-
-                RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
-                        resolvedBody, 0, "Timeout", Collections.emptyMap(), "Request timed out after " + timeoutMs + "ms", 0, durationMs, "TIMEOUT");
-
-                return ExecutionResponseDto.builder()
-                        .statusCode(504)
-                        .statusText("Gateway Timeout")
-                        .durationMs(durationMs)
-                        .sizeBytes(0)
-                        .headers(Collections.emptyMap())
-                        .body("Request timed out after " + timeoutMs + "ms: " + e.getMessage())
-                        .errorCategory("TIMEOUT")
-                        .errorMessage("Request timed out after " + timeoutMs + "ms")
-                        .historyId(history.getId())
-                        .build();
-
-            } catch (IOException e) {
-                durationMs = System.currentTimeMillis() - startTime;
-                log.warn("Network error executing request: {} - {}", fullUrl, e.getMessage());
-
-                RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
-                        resolvedBody, 0, "Network Error", Collections.emptyMap(), e.getMessage(), 0, durationMs, "NETWORK_ERROR");
-
-                return ExecutionResponseDto.builder()
-                        .statusCode(502)
-                        .statusText("Bad Gateway / Network Error")
-                        .durationMs(durationMs)
-                        .sizeBytes(0)
-                        .headers(Collections.emptyMap())
-                        .body("Network error: " + e.getMessage())
-                        .errorCategory("NETWORK_ERROR")
-                        .errorMessage("Could not connect to target host: " + e.getMessage())
-                        .historyId(history.getId())
-                        .build();
             }
 
+        } catch (SsrfSecurityException e) {
+            durationMs = (System.nanoTime() - startNano) / 1_000_000L;
+            log.warn("SSRF security policy blocked redirect/request: {}", e.getMessage());
+            RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
+                    resolvedBody, 403, "Forbidden", Collections.emptyMap(), e.getMessage(), 0, durationMs, "SECURITY_VIOLATION");
+
+            return ExecutionResponseDto.builder()
+                    .statusCode(403)
+                    .statusText("Forbidden")
+                    .durationMs(durationMs)
+                    .sizeBytes(0)
+                    .headers(Collections.emptyMap())
+                    .body(e.getMessage())
+                    .errorCategory("SECURITY_VIOLATION")
+                    .errorMessage(e.getMessage())
+                    .historyId(history.getId())
+                    .build();
+
+        } catch (SocketTimeoutException e) {
+            durationMs = (System.nanoTime() - startNano) / 1_000_000L;
+            log.warn("Request timed out after {}ms: {}", durationMs, redactSensitiveUrl(fullUrl));
+
+            RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
+                    resolvedBody, 504, "Gateway Timeout", Collections.emptyMap(), "Request timed out after " + timeoutMs + "ms", 0, durationMs, "TIMEOUT");
+
+            return ExecutionResponseDto.builder()
+                    .statusCode(504)
+                    .statusText("Gateway Timeout")
+                    .durationMs(durationMs)
+                    .sizeBytes(0)
+                    .headers(Collections.emptyMap())
+                    .body("Request timed out after " + timeoutMs + "ms: " + e.getMessage())
+                    .errorCategory("TIMEOUT")
+                    .errorMessage("Request timed out after " + timeoutMs + "ms")
+                    .historyId(history.getId())
+                    .build();
+
+        } catch (UnknownHostException e) {
+            durationMs = (System.nanoTime() - startNano) / 1_000_000L;
+            log.warn("DNS resolution / Connection blocked: {}", e.getMessage());
+            boolean isSsrf = e.getMessage() != null && e.getMessage().contains("SSRF");
+            int statusCode = isSsrf ? 403 : 502;
+            String statusText = isSsrf ? "Forbidden" : "Bad Gateway";
+            String category = isSsrf ? "SECURITY_VIOLATION" : "NETWORK_ERROR";
+            String errorMsg = isSsrf ? e.getMessage() : "Could not resolve or connect to target host: " + e.getMessage();
+
+            RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
+                    resolvedBody, statusCode, statusText, Collections.emptyMap(), errorMsg, 0, durationMs, category);
+
+            return ExecutionResponseDto.builder()
+                    .statusCode(statusCode)
+                    .statusText(statusText)
+                    .durationMs(durationMs)
+                    .sizeBytes(0)
+                    .headers(Collections.emptyMap())
+                    .body(errorMsg)
+                    .errorCategory(category)
+                    .errorMessage(errorMsg)
+                    .historyId(history.getId())
+                    .build();
+
+        } catch (IOException e) {
+            durationMs = (System.nanoTime() - startNano) / 1_000_000L;
+            log.warn("Network error executing request: {} - {}", redactSensitiveUrl(fullUrl), e.getMessage());
+
+            Throwable cause = e.getCause();
+            boolean isSsrf = (cause != null && cause.getMessage() != null && cause.getMessage().contains("SSRF"))
+                    || (e.getMessage() != null && e.getMessage().contains("SSRF"));
+            int statusCode = isSsrf ? 403 : 502;
+            String statusText = isSsrf ? "Forbidden" : "Bad Gateway / Network Error";
+            String category = isSsrf ? "SECURITY_VIOLATION" : "NETWORK_ERROR";
+            String errorMsg = isSsrf ? (cause != null ? cause.getMessage() : e.getMessage()) : "Could not connect to target host: " + e.getMessage();
+
+            RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
+                    resolvedBody, statusCode, statusText, Collections.emptyMap(), errorMsg, 0, durationMs, category);
+
+            return ExecutionResponseDto.builder()
+                    .statusCode(statusCode)
+                    .statusText(statusText)
+                    .durationMs(durationMs)
+                    .sizeBytes(0)
+                    .headers(Collections.emptyMap())
+                    .body("Network error: " + errorMsg)
+                    .errorCategory(category)
+                    .errorMessage(errorMsg)
+                    .historyId(history.getId())
+                    .build();
+
         } catch (Exception e) {
-            durationMs = System.currentTimeMillis() - startTime;
+            durationMs = (System.nanoTime() - startNano) / 1_000_000L;
             log.error("Execution error: {}", e.getMessage(), e);
 
             RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
-                    resolvedBody, 0, "Execution Error", Collections.emptyMap(), e.getMessage(), 0, durationMs, "NETWORK_ERROR");
+                    resolvedBody, 500, "Execution Error", Collections.emptyMap(), e.getMessage(), 0, durationMs, "NETWORK_ERROR");
 
             return ExecutionResponseDto.builder()
                     .statusCode(500)
@@ -213,6 +379,185 @@ public class RequestExecutionService {
                     .historyId(history.getId())
                     .build();
         }
+    }
+
+    /**
+     * Determines whether two URIs share the exact same origin (Scheme, Host, and effective Port).
+     */
+    public boolean isSameOrigin(URI uri1, URI uri2) {
+        if (uri1 == null || uri2 == null) {
+            return false;
+        }
+        String scheme1 = uri1.getScheme() != null ? uri1.getScheme().toLowerCase(Locale.ROOT) : "";
+        String scheme2 = uri2.getScheme() != null ? uri2.getScheme().toLowerCase(Locale.ROOT) : "";
+        if (!scheme1.equals(scheme2)) {
+            return false;
+        }
+
+        String host1 = uri1.getHost() != null ? uri1.getHost().toLowerCase(Locale.ROOT) : "";
+        String host2 = uri2.getHost() != null ? uri2.getHost().toLowerCase(Locale.ROOT) : "";
+        if (!host1.equals(host2)) {
+            return false;
+        }
+
+        int port1 = uri1.getPort() != -1 ? uri1.getPort() : ("https".equals(scheme1) ? 443 : 80);
+        int port2 = uri2.getPort() != -1 ? uri2.getPort() : ("https".equals(scheme2) ? 443 : 80);
+        return port1 == port2;
+    }
+
+    public String redactSensitiveUrl(String url) {
+        if (url == null || url.trim().isEmpty()) {
+            return url;
+        }
+        int queryIndex = url.indexOf('?');
+        if (queryIndex < 0) {
+            return url;
+        }
+
+        String base = url.substring(0, queryIndex);
+        String queryAndFragment = url.substring(queryIndex + 1);
+
+        String fragment = "";
+        int fragmentIndex = queryAndFragment.indexOf('#');
+        if (fragmentIndex >= 0) {
+            fragment = queryAndFragment.substring(fragmentIndex);
+            queryAndFragment = queryAndFragment.substring(0, fragmentIndex);
+        }
+
+        if (queryAndFragment.isEmpty()) {
+            return base + fragment;
+        }
+
+        String[] pairs = queryAndFragment.split("&");
+        List<String> redactedPairs = new ArrayList<>();
+        for (String pair : pairs) {
+            if (pair.isEmpty()) {
+                continue;
+            }
+            int eqIndex = pair.indexOf('=');
+            String key = eqIndex >= 0 ? pair.substring(0, eqIndex) : pair;
+            String cleanKey = key.trim().toLowerCase(Locale.ROOT);
+            String decodedKey = cleanKey;
+            try {
+                decodedKey = URLDecoder.decode(cleanKey, StandardCharsets.UTF_8).toLowerCase(Locale.ROOT);
+            } catch (Exception ignored) {}
+
+            if (isSensitiveParam(cleanKey) || isSensitiveParam(decodedKey)) {
+                redactedPairs.add(key + "=[REDACTED]");
+            } else {
+                redactedPairs.add(pair);
+            }
+        }
+
+        return base + "?" + String.join("&", redactedPairs) + fragment;
+    }
+
+    private boolean isSensitiveParam(String cleanKey) {
+        if (cleanKey == null) return false;
+        if (SENSITIVE_PARAM_NAMES.contains(cleanKey)) {
+            return true;
+        }
+        return cleanKey.contains("secret") || cleanKey.contains("password") || cleanKey.contains("passwd")
+                || cleanKey.contains("token") || cleanKey.contains("apikey");
+    }
+
+    public List<KeyValueDto> redactSensitiveHeaders(List<KeyValueDto> headers) {
+        if (headers == null) {
+            return Collections.emptyList();
+        }
+        List<KeyValueDto> redacted = new ArrayList<>();
+        for (KeyValueDto h : headers) {
+            if (h == null) continue;
+            String key = h.getKey();
+            String val = h.getValue();
+            if (key != null) {
+                String cleanKey = key.trim().toLowerCase(Locale.ROOT);
+                if (isSensitiveHeaderName(cleanKey)) {
+                    val = "[REDACTED]";
+                }
+            }
+            redacted.add(new KeyValueDto(key, val, h.isEnabled()));
+        }
+        return redacted;
+    }
+
+    public boolean isSensitiveHeaderName(String cleanKey) {
+        if (cleanKey == null) return false;
+        String lower = cleanKey.trim().toLowerCase(Locale.ROOT);
+        if (SENSITIVE_HEADER_NAMES.contains(lower)) {
+            return true;
+        }
+        return lower.contains("token") || lower.contains("secret") || lower.contains("key")
+                || lower.contains("auth") || lower.contains("cookie");
+    }
+
+    /**
+     * Recursively redacts sensitive properties in JSON request/response bodies.
+     * Safely returns original content unmodified if payload is not valid JSON.
+     */
+    public String redactSensitiveJson(String jsonString) {
+        if (jsonString == null || jsonString.trim().isEmpty()) {
+            return jsonString;
+        }
+        try {
+            JsonNode rootNode = objectMapper.readTree(jsonString);
+            if (rootNode == null || (!rootNode.isObject() && !rootNode.isArray())) {
+                return jsonString;
+            }
+            JsonNode redactedNode = redactJsonNode(rootNode);
+            return objectMapper.writeValueAsString(redactedNode);
+        } catch (Exception e) {
+            // Malformed JSON or non-JSON text; return safely without error
+            return jsonString;
+        }
+    }
+
+    private JsonNode redactJsonNode(JsonNode node) {
+        if (node.isObject()) {
+            ObjectNode objectNode = (ObjectNode) node.deepCopy();
+            List<String> fieldNames = new ArrayList<>();
+            objectNode.fieldNames().forEachRemaining(fieldNames::add);
+
+            for (String fieldName : fieldNames) {
+                JsonNode child = objectNode.get(fieldName);
+                String cleanField = fieldName.trim().toLowerCase(Locale.ROOT);
+                if (isSensitiveJsonField(cleanField)) {
+                    if (child.isValueNode()) {
+                        objectNode.put(fieldName, "[REDACTED]");
+                    } else if (child.isObject() || child.isArray()) {
+                        objectNode.set(fieldName, redactJsonNode(child));
+                    }
+                } else if (child.isObject() || child.isArray()) {
+                    objectNode.set(fieldName, redactJsonNode(child));
+                }
+            }
+            return objectNode;
+        } else if (node.isArray()) {
+            ArrayNode arrayNode = (ArrayNode) node.deepCopy();
+            for (int i = 0; i < arrayNode.size(); i++) {
+                JsonNode item = arrayNode.get(i);
+                if (item.isObject() || item.isArray()) {
+                    arrayNode.set(i, redactJsonNode(item));
+                }
+            }
+            return arrayNode;
+        }
+        return node;
+    }
+
+    public boolean isSensitiveJsonField(String cleanField) {
+        if (cleanField == null) return false;
+        String lower = cleanField.trim().toLowerCase(Locale.ROOT);
+        if (SENSITIVE_JSON_FIELDS.contains(lower)) {
+            return true;
+        }
+        return lower.contains("secret") || lower.contains("password") || lower.contains("passwd")
+                || lower.contains("token") || lower.contains("apikey") || lower.contains("auth")
+                || lower.contains("credential");
+    }
+
+    private boolean isRedirectStatus(int statusCode) {
+        return statusCode == 301 || statusCode == 302 || statusCode == 303 || statusCode == 307 || statusCode == 308;
     }
 
     private String buildFullUrl(String baseUrl, List<KeyValueDto> queryParams, AuthDto auth, Long envId) {
@@ -246,14 +591,26 @@ public class RequestExecutionService {
         return urlBuilder.toString();
     }
 
-    private void applyHeaders(HttpUriRequestBase request, List<KeyValueDto> headers, AuthDto auth, Long envId) {
+    public void applyHeaders(HttpUriRequestBase request, List<KeyValueDto> headers, AuthDto auth, Long envId, boolean isCrossOrigin) {
         boolean hasContentType = false;
 
         if (headers != null) {
             for (KeyValueDto header : headers) {
                 if (header.isEnabled() && header.getKey() != null && !header.getKey().trim().isEmpty()) {
-                    String resolvedKey = substitutionService.substitute(header.getKey().trim(), envId);
-                    String resolvedVal = substitutionService.substitute(header.getValue() != null ? header.getValue().trim() : "", envId);
+                    String cleanKey = header.getKey().trim().toLowerCase(Locale.ROOT);
+                    // On cross-origin redirects, strip sensitive credential-bearing headers
+                    if (isCrossOrigin && isSensitiveHeaderName(cleanKey)) {
+                        log.debug("Stripping sensitive header '{}' during cross-origin redirect", header.getKey());
+                        continue;
+                    }
+
+                    String rawKey = header.getKey().trim();
+                    String rawVal = header.getValue() != null ? header.getValue().trim() : "";
+                    String resolvedKey = substitutionService.substitute(rawKey, envId);
+                    if (resolvedKey == null) resolvedKey = rawKey;
+                    String resolvedVal = substitutionService.substitute(rawVal, envId);
+                    if (resolvedVal == null) resolvedVal = rawVal;
+
                     request.addHeader(resolvedKey, resolvedVal);
                     if ("content-type".equalsIgnoreCase(resolvedKey)) {
                         hasContentType = true;
@@ -262,11 +619,15 @@ public class RequestExecutionService {
             }
         }
 
-        // Apply API Key via Header if configured
-        if (auth != null && "API_KEY".equalsIgnoreCase(auth.getType()) && "HEADER".equalsIgnoreCase(auth.getPlacement())) {
+        // Apply API Key via Header if configured - ONLY if same origin!
+        if (!isCrossOrigin && auth != null && "API_KEY".equalsIgnoreCase(auth.getType()) && "HEADER".equalsIgnoreCase(auth.getPlacement())) {
             if (auth.getKeyName() != null && !auth.getKeyName().trim().isEmpty()) {
-                String resolvedKey = substitutionService.substitute(auth.getKeyName().trim(), envId);
-                String resolvedVal = substitutionService.substitute(auth.getKeyValue() != null ? auth.getKeyValue().trim() : "", envId);
+                String rawKey = auth.getKeyName().trim();
+                String rawVal = auth.getKeyValue() != null ? auth.getKeyValue().trim() : "";
+                String resolvedKey = substitutionService.substitute(rawKey, envId);
+                if (resolvedKey == null) resolvedKey = rawKey;
+                String resolvedVal = substitutionService.substitute(rawVal, envId);
+                if (resolvedVal == null) resolvedVal = rawVal;
                 request.addHeader(resolvedKey, resolvedVal);
             }
         }
@@ -300,6 +661,11 @@ public class RequestExecutionService {
             case 200 -> "OK";
             case 201 -> "Created";
             case 204 -> "No Content";
+            case 301 -> "Moved Permanently";
+            case 302 -> "Found";
+            case 303 -> "See Other";
+            case 307 -> "Temporary Redirect";
+            case 308 -> "Permanent Redirect";
             case 400 -> "Bad Request";
             case 401 -> "Unauthorized";
             case 403 -> "Forbidden";
@@ -317,14 +683,17 @@ public class RequestExecutionService {
                                               Map<String, String> responseHeaders, String responseBody,
                                               long responseSize, long durationMs, String errorCategory) {
         try {
-            String headersJson = headers != null ? objectMapper.writeValueAsString(headers) : "[]";
+            String safeUrl = redactSensitiveUrl(url);
+            List<KeyValueDto> safeHeaders = redactSensitiveHeaders(headers);
+            String safeBody = redactSensitiveJson(body);
+            String headersJson = safeHeaders != null ? objectMapper.writeValueAsString(safeHeaders) : "[]";
             String respHeadersJson = responseHeaders != null ? objectMapper.writeValueAsString(responseHeaders) : "{}";
 
             RequestHistoryEntity entity = RequestHistoryEntity.builder()
                     .method(method)
-                    .url(url)
+                    .url(safeUrl)
                     .requestHeaders(headersJson)
-                    .requestBody(body)
+                    .requestBody(safeBody)
                     .responseStatus(status)
                     .responseStatusText(statusText)
                     .responseHeaders(respHeadersJson)
@@ -340,7 +709,8 @@ public class RequestExecutionService {
             log.error("Failed to serialize history metadata: {}", e.getMessage());
             RequestHistoryEntity fallback = RequestHistoryEntity.builder()
                     .method(method)
-                    .url(url)
+                    .url(redactSensitiveUrl(url))
+                    .requestBody(redactSensitiveJson(body))
                     .responseStatus(status)
                     .responseStatusText(statusText)
                     .durationMs(durationMs)

@@ -16,9 +16,8 @@ const api = axios.create({
 });
 
 export const playgroundApi = {
-  // Execute Request
-  executeRequest: async (payload: ExecuteRequestPayload): Promise<ExecutionResponse> => {
-    const response = await api.post<ExecutionResponse>('/execute', payload);
+  executeRequest: async (payload: ExecuteRequestPayload, signal?: AbortSignal): Promise<ExecutionResponse> => {
+    const response = await api.post<ExecutionResponse>('/execute', payload, { signal });
     return response.data;
   },
 
