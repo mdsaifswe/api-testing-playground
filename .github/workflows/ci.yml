@@ -1,0 +1,68 @@
+name: API Testing Playground CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  backend-test-and-build:
+    name: Backend Test & Package (Spring Boot + Java 17)
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: api_testing_playground
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping -h localhost -uroot -proot" --health-interval=10s --health-timeout=5s --health-retries=5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Backend Compile & Test
+        working-directory: backend
+        run: mvn clean test
+
+      - name: Package Backend JAR
+        working-directory: backend
+        run: mvn package -DskipTests
+
+  frontend-test-and-build:
+    name: Frontend Test & Build (React + TypeScript + Vite)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Frontend Dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run Vitest Suite
+        working-directory: frontend
+        run: npm test
+
+      - name: Run Production Bundle Build
+        working-directory: frontend
+        run: npm run build

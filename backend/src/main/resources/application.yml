@@ -1,0 +1,40 @@
+server:
+  port: 8080
+  shutdown: graceful
+
+spring:
+  application:
+    name: api-testing-playground
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:h2:file:./data/api_playground_db;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;AUTO_SERVER=TRUE}
+    driver-class-name: ${SPRING_DATASOURCE_DRIVER:org.h2.Driver}
+    username: ${SPRING_DATASOURCE_USERNAME:sa}
+    password: ${SPRING_DATASOURCE_PASSWORD:}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: false
+        dialect: org.hibernate.dialect.H2Dialect
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operationsSorter: method
+
+playground:
+  security:
+    allow-loopback: ${PLAYGROUND_ALLOW_LOOPBACK:true} # Allowed for echo endpoints & local testing, configurable
+    allow-private-ips: ${PLAYGROUND_ALLOW_PRIVATE_IPS:true} # Configurable for local subnet / enterprise test endpoints
+    max-redirects: 5
+    connect-timeout-ms: 10000
+    read-timeout-ms: 30000
+    max-response-size-bytes: 5242880 # 5 MB max payload
