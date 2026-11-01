@@ -20,6 +20,10 @@ public class EnvironmentEntity {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "workspace_id")
+    private WorkspaceEntity workspace;
+
     @Column(nullable = false, length = 150)
     private String name;
 

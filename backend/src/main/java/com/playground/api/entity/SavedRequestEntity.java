@@ -22,6 +22,10 @@ public class SavedRequestEntity {
     @JoinColumn(name = "collection_id")
     private CollectionEntity collection;
 
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "workspace_id")
+    private WorkspaceEntity workspace;
+
     @Column(nullable = false, length = 150)
     private String name;
 
@@ -44,7 +48,7 @@ public class SavedRequestEntity {
     @Column(name = "auth_config", columnDefinition = "TEXT")
     private String authConfig;
 
-    @Column(columnDefinition = "LONGTEXT")
+    @Column(columnDefinition = "TEXT")
     private String body;
 
     @Column(name = "created_at", nullable = false, updatable = false)

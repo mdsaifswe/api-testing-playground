@@ -1,0 +1,23 @@
+# PostgreSQL Profile Configuration (for Neon and production deployments)
+spring:
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:api_testing_playground}?sslmode=require}
+    driver-class-name: org.postgresql.Driver
+    username: ${SPRING_DATASOURCE_USERNAME:${DB_USER:postgres}}
+    password: ${SPRING_DATASOURCE_PASSWORD:${DB_PASSWORD:postgres}}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration-postgres
+
+# Production SSRF Policy: strictly block loopback and private IPs by default
+playground:
+  security:
+    allow-loopback: ${PLAYGROUND_ALLOW_LOOPBACK:false}
+    allow-private-ips: ${PLAYGROUND_ALLOW_PRIVATE_IPS:false}

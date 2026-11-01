@@ -1,49 +1,92 @@
 # API Testing Playground
 
-A full-stack API testing platform built with React, TypeScript, Java, Spring Boot, and MySQL/H2. It allows users to create, configure, send, and inspect HTTP requests through a browser-based interface.
-
-The project demonstrates full-stack development, REST API integration, backend engineering, database persistence, automated testing, and security-focused request execution.
+A full-stack, secure, multi-tenant API testing platform built with React 18, TypeScript, Java 17, Spring Boot 3, and support for H2, MySQL 8, and PostgreSQL (Neon). It allows developers and testers to create, configure, execute, and inspect HTTP requests through a browser-based interface while enforcing strict resource protection, workspace isolation, rate limiting, and SSRF defenses.
 
 ---
 
-## Features
+## Architecture Overview
 
-### API Request Builder
-- Support for `GET`, `POST`, `PUT`, `PATCH`, and `DELETE`.
-- Configure request URLs, query parameters, headers, and request bodies.
-- Support API key and authorization headers.
-- Execute requests through the Spring Boot backend.
-- Inspect response status, headers, body, and execution time.
-- Handle network errors and request timeouts.
-- Cancel requests from the frontend.
+```mermaid
+flowchart TD
+    subgraph Client["Frontend (Cloudflare Pages / Local)"]
+        UI[React 18 + TypeScript UI]
+        Storage[LocalStorage: X-Workspace-Key]
+        Axios[Axios HTTP Client + Interceptor]
+        UI --> Storage
+        Storage --> Axios
+    end
 
-### Request Management
-- Save and organize request collections.
-- Manage environments and variables.
-- Reuse saved requests.
-- View request execution history.
-- Persist collections, environments, and history using the backend database.
+    subgraph Backend["Backend (Render Free Web Service / Local)"]
+        Filter[WorkspaceInterceptor + RateLimitingService]
+        Controller[Spring Boot REST Controllers]
+        Subst[VariableSubstitutionService]
+        Exec[RequestExecutionService]
+        SSRF[SsrfValidator + SafeDnsResolver]
+        HttpClient[Apache HttpClient 5 Bounded Client]
+
+        Axios -->|X-Workspace-Key /api/v1| Filter
+        Filter --> Controller
+        Controller --> Subst
+        Controller --> Exec
+        Exec --> SSRF
+        SSRF --> HttpClient
+    end
+
+    subgraph External["External Network"]
+        TargetAPI[Target REST APIs / Webhooks]
+        HttpClient --> TargetAPI
+    end
+
+    subgraph Database["Persistence Layer (Neon PostgreSQL / MySQL 8 / H2)"]
+        JPA[Spring Data JPA / Hibernate]
+        Flyway[Flyway Migrations V1, V2, V3]
+        DB[(Isolated Workspaces & Data)]
+        Controller --> JPA
+        JPA --> DB
+        Flyway --> DB
+    end
+```
 
 ---
 
-## Security
+## Key Features
 
-Security was an important part of the backend implementation:
-- **Server-Side Request Validation:** Outbound target URLs are strictly validated before execution.
-- **SSRF Protection:** Defense against private networks (RFC 1918), loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), and cloud metadata destinations (`169.254.169.254`, `metadata.google.internal`).
-- **DNS Resolution Validation:** Custom `SafeDnsResolver` wired into Apache HttpClient 5 connection manager to defend against DNS rebinding (TOCTOU) attacks at socket connection time.
-- **Manual Redirect Handling:** Automatic client redirects are disabled; redirects are validated hop-by-hop up to a maximum limit with loop detection and protocol downgrade prevention.
-- **Cross-Origin Credential Stripping:** In accordance with RFC 7235 and Fetch standards, sensitive headers (`Authorization`, `Cookie`, `X-API-Key`, etc.) and credentials are automatically stripped when a redirect targets a different origin (scheme, host, or port).
-- **IPv6 Protection:** Byte-level validation against RFC 4193 IPv6 Unique Local Address range (`fc00::/7` covering `fc00::/8` and `fd00::/8`) and unwrapping of IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`).
-- **Query Parameter & Header Redaction:** Sensitive query parameter keys (`apiKey`, `token`, `password`, `secret`, etc.) and headers (`Authorization`, `Cookie`, `X-API-Key`) are masked with `[REDACTED]` prior to history persistence.
-- **Recursive JSON Body Secret Redaction:** Recursively redacts sensitive JSON keys in nested objects and arrays within persisted request history.
-- **Resource Limits:** Connection timeout (10s), configurable response timeout, and maximum response payload bounds (5MB) prevent denial-of-service exhaustion.
+### 1. Interactive Request Builder
+- Full HTTP method support: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`.
+- Configurable URL, query parameters, custom headers, authorization schemes, and body payloads (JSON, text).
+- Real-time execution with status badges, response size, duration timing, and formatted response body viewer.
+- Copy request as reproducible `cURL` command with one click.
+- Client-side execution cancellation via standard `AbortController`.
 
-### Documented Security Limitations
-These limitations are documented rather than presented as solved security features:
-- **Environment Secrets:** Environment variables marked as secret are still returned by the environment API (`GET /api/v1/environments`). UI masking in the frontend does not protect these values from users with direct API access.
-- **Backend Request Cancellation:** Frontend cancellation via `AbortController` terminates the client-to-backend connection, but does not currently guarantee cancellation of the backend's synchronous outbound request executing on the servlet worker thread.
-- **Non-JSON Payloads:** Malformed or non-JSON request bodies (e.g., plain text or custom encodings) may not receive the same recursive secret redaction as valid JSON payloads.
+### 2. Anonymous Workspace Isolation
+- **High-Entropy Credentials:** Server-generated 256-bit cryptographic workspace keys (`wpk_...`).
+- **Server-Side Key Hashing:** Stored securely using SHA-256 hashes (`workspaces` table); raw keys are never stored on the backend.
+- **Strict Data Isolation:** Every query and mutation for Collections, Saved Requests, Environments, and History enforces workspace ownership.
+- **Enumeration Defense:** Attempts to access or mutate another workspace's records return `404 Not Found`, preventing resource enumeration.
+- **Zero Configuration for Visitors:** The frontend automatically acquires and persists the workspace key in browser `localStorage`.
+
+### 3. Comprehensive Request Security & SSRF Defense
+- **Strict Protocol Enforcement:** Only `http` and `https` schemes are accepted.
+- **Anti-SSRF Protection:** Configurable blocking of private networks (RFC 1918), loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), and cloud metadata services (`169.254.169.254`, `metadata.google.internal`).
+- **Safe DNS Resolution:** Custom `SafeDnsResolver` wired into Apache HttpClient 5 socket connection pool to defend against DNS rebinding (TOCTOU) attacks.
+- **Secure Redirects:** Automatic client redirects are disabled; redirects are validated hop-by-hop with loop detection and cross-origin credential stripping (RFC 7235).
+- **Genuine 15-Second Outbound Deadline:** Enforced across all redirect hops, DNS resolution, connection acquisition, and response body streaming.
+- **Bounded Stream Reading:** Enforces maximum response body limits (default 5 MB); oversized streams are aborted promptly and connection sockets are released without memory exhaustion.
+
+### 4. Public API Abuse Prevention & Rate Limiting
+- **In-Memory Token Bucket Rate Limiting:** Enforced server-side for expensive operations.
+  - Workspace creation: 10 requests / minute per client IP.
+  - Outbound request execution: 30 requests / minute per workspace.
+- Returns HTTP `429 Too Many Requests` with a `Retry-After: 60` response header.
+
+### 5. Sensitive Data & History Redaction
+- **Secret Environment Variables:** Secret values are returned masked with `********` across all endpoints (`GET /api/v1/environments`). Blank or masked updates preserve stored secrets.
+- **History Redaction:** Automatically redacts sensitive query parameters (`apiKey`, `token`, `password`, `secret`, `authorization`, etc.), sensitive headers (`Authorization`, `X-API-Key`, `Cookie`), and recursively redacts sensitive JSON fields before storing in database history.
+- **Environment Secret Redaction:** Environment secret values substituted into URLs or request bodies are sanitized to `[REDACTED]` prior to persistence.
+
+### 6. Sanitized Health Endpoint
+- Anonymous health check (`GET /api/v1/health`) reports service health (`UP` / `DEGRADED`) and database connectivity status.
+- Never discloses JDBC connection URLs, hostnames, database usernames, vendor details, or stack traces.
 
 ---
 
@@ -51,205 +94,177 @@ These limitations are documented rather than presented as solved security featur
 
 | Layer | Technologies |
 |---|---|
-| **Frontend** | React 18, TypeScript, Vite |
-| **Styling** | Tailwind CSS |
-| **HTTP Client** | Axios |
-| **Backend** | Java 17, Spring Boot 3 |
-| **Persistence** | Spring Data JPA, Hibernate |
-| **Database** | H2 (embedded file mode), MySQL 8 |
-| **Database Migrations** | Flyway |
-| **Testing** | JUnit 5, Mockito, Vitest, React Testing Library |
-| **API Documentation** | Springdoc OpenAPI (Swagger UI) |
+| **Frontend** | React 18, TypeScript, Vite, Tailwind CSS, Axios, Lucide Icons |
+| **Backend** | Java 17, Spring Boot 3.2.5, Spring Data JPA, Hibernate 6, Maven |
+| **Outbound HTTP** | Apache HttpClient 5 (classic connection pooling, custom DNS resolver) |
+| **Database Support** | H2 (in-memory test / embedded file dev), MySQL 8, PostgreSQL 15+ / Neon |
+| **Database Migrations** | Flyway (V1 Schema, V2 Environments & Saved Requests, V3 Workspace Isolation) |
+| **Testing** | JUnit 5, Mockito, Spring Boot Test, Vitest, React Testing Library |
+| **Deployment Targets** | Cloudflare Pages (Frontend), Render Free Web Service (Backend), Neon (PostgreSQL) |
 | **Containerization** | Docker, Docker Compose |
-| **CI** | GitHub Actions |
 
 ---
 
-## Architecture
+## Environment Variables Reference
 
-The frontend communicates with the Spring Boot backend. The backend manages application data and executes outbound HTTP requests on behalf of the user.
+### Backend Configuration
 
-```mermaid
-flowchart TD
-    A[User] --> B[React + TypeScript Frontend]
-    B --> C[Spring Boot REST API]
-    C --> D[Request Validation]
-    D --> E[SSRF Protection + Safe DNS Resolver]
-    E --> F[Outbound HTTP Client]
-    F --> G[External APIs]
-    C --> H[Service Layer]
-    H --> I[Spring Data JPA / Hibernate]
-    I --> J[(H2 / MySQL Database)]
-    C --> K[Request History]
-```
+| Environment Variable | Default Value | Description |
+|---|---|---|
+| `PORT` | `8080` | HTTP port assigned by Render or container runtime |
+| `SPRING_PROFILES_ACTIVE` | `default` | Active Spring profile (`default`, `mysql`, or `postgres`) |
+| `SPRING_DATASOURCE_URL` | H2 file db | JDBC database URL (e.g., `jdbc:postgresql://<neon-host>/<db>?sslmode=require`) |
+| `SPRING_DATASOURCE_USERNAME` | `sa` | Database connection username |
+| `SPRING_DATASOURCE_PASSWORD` | *(empty)* | Database connection password |
+| `SPRING_DATASOURCE_DRIVER` | `org.h2.Driver` | JDBC driver class name (`org.postgresql.Driver`, `com.mysql.cj.jdbc.Driver`) |
+| `PLAYGROUND_CORS_ALLOWED_ORIGINS` | `http://localhost:[*],...` | Comma-separated list of allowed frontend origins (e.g., `https://<app>.pages.dev`) |
+| `PLAYGROUND_ALLOW_LOOPBACK` | `true` (dev) / `false` (prod) | Allow requests to `localhost` / `127.0.0.1` (disable in public production) |
+| `PLAYGROUND_ALLOW_PRIVATE_IPS` | `true` (dev) / `false` (prod) | Allow requests to RFC 1918 private IP ranges (disable in public production) |
+
+### Frontend Configuration
+
+| Environment Variable | Default Value | Description |
+|---|---|---|
+| `VITE_API_URL` | *(empty / relative)* | Backend API base URL (e.g., `https://<backend-service>.onrender.com`). Falls back to relative `/api/v1` for Vite proxy. |
 
 ---
 
-## Getting Started
+## Local Development Setup
 
 ### Prerequisites
-Install the following tools:
 - **Java 17** (JDK 17)
 - **Maven** (3.8+)
 - **Node.js** (18+) and **npm** (9+)
 - **Git**
 
-Optional:
-- **Docker Desktop**
-- **MySQL 8**
-
----
-
-### 1. Clone the Repository
+### 1. Clone Repository
 ```bash
 git clone https://github.com/mdsaifswe/api-testing-playground.git
 cd api-testing-playground
 ```
 
----
-
-### 2. Start the Backend
-Open a terminal:
+### 2. Start Backend (Local H2 Mode)
 ```bash
 cd backend
 mvn spring-boot:run
 ```
+The backend starts on `http://localhost:8080` with:
+- Health endpoint: `http://localhost:8080/api/v1/health`
+- Swagger UI documentation: `http://localhost:8080/swagger-ui.html`
+- Embedded Echo server: `http://localhost:8080/api/v1/echo/...`
 
-The backend should be available at:
-- **Application URL:** `http://localhost:8080`
-- **Health Check:** `http://localhost:8080/api/v1/health`
-- **API Documentation (Swagger UI):** `http://localhost:8080/swagger-ui.html`
-
-*The default local configuration uses H2, so a separate MySQL installation is not required for the basic local setup.*
-
----
-
-### 3. Start the Frontend
-Open a second terminal from the project root:
+### 3. Start Frontend
+In a new terminal window:
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
-
-Open your browser at:
-`http://localhost:5173`
+Open `http://localhost:5173` in your browser.
 
 ---
 
-### 4. Run with Docker
-If Docker Desktop is installed and running:
+## Running Automated Tests
+
+### Backend Test Suite (JUnit 5 + Spring Boot Test)
 ```bash
-docker-compose up --build -d
-```
-
-The Docker Compose configuration provides a containerized multi-service environment:
-- **Frontend:** `http://localhost:3000` (Nginx serving production bundle)
-- **Backend API:** `http://localhost:8080`
-- **MySQL 8:** Port `3306` (`api_testing_playground` database)
-
-To stop the containers:
-```bash
-docker-compose down
-```
-
----
-
-## Running Tests
-
-### Backend Tests
-From the `backend` directory:
-```bash
+cd backend
 mvn test
 ```
+*Executes all 89 unit, security, and integration tests against an isolated in-memory H2 database.*
 
-### Frontend Tests
-From the `frontend` directory:
+To build and package the production JAR:
 ```bash
-npm test
+mvn package -DskipTests
 ```
 
-### Frontend Production Build
+### Frontend Test Suite (Vitest + React Testing Library)
+```bash
+cd frontend
+npm test -- --run
+```
+*Executes all 21 frontend unit and component tests.*
+
+To build the production bundle:
 ```bash
 npm run build
 ```
 
-### Reported Test Results
-The latest project verification report recorded:
+---
 
-| Test Suite | Passed | Failed | Skipped |
-|---|---|---|---|
-| **Backend (JUnit 5 + MockMvc)** | 45 | 0 | 0 |
-| **Frontend (Vitest + React Testing Library)** | 13 | 0 | 0 |
-| **Total** | **58** | **0** | **0** |
+## Production Deployment Guide
 
-The reported backend package (`mvn package -DskipTests`) and frontend production build (`npm run build`) also completed successfully.
-
-> [!NOTE]
-> **Verification scope:** These are results from the latest local verification report. A live MySQL 8 runtime and a successful GitHub Actions execution have not yet been independently confirmed.
+### Deployment Architecture
+- **Frontend:** Cloudflare Pages (free edge static hosting)
+- **Backend:** Render Free Web Service (Docker / container-aware JVM)
+- **Database:** Neon Free Serverless PostgreSQL
 
 ---
 
-## Project Structure
-
-```text
-api-testing-playground/
-├── backend/
-│   ├── src/
-│   │   ├── main/
-│   │   │   ├── java/
-│   │   │   └── resources/
-│   │   └── test/
-│   └── pom.xml
-├── frontend/
-│   ├── src/
-│   ├── public/
-│   └── package.json
-├── docker-compose.yml
-├── README.md
-└── .github/
-    └── workflows/
-        └── ci.yml
-```
+### Step 1: Set Up Neon Database (PostgreSQL)
+1. Log in to [Neon Console](https://console.neon.tech).
+2. Create a new project (e.g., `api-testing-playground-db`).
+3. Neon provides a PostgreSQL connection string in the format:
+   ```text
+   postgresql://<username>:<password>@<ep-xyz>.us-east-2.aws.neon.tech/<dbname>?sslmode=require
+   ```
+4. Note the host, database name, username, and password.
+5. Spring Boot format for JDBC URL:
+   ```text
+   jdbc:postgresql://<ep-xyz>.us-east-2.aws.neon.tech/<dbname>?sslmode=require
+   ```
+*Flyway migrations (`V1`, `V2`, `V3`) will automatically execute on application startup.*
 
 ---
 
-## Engineering Highlights
-
-This project goes beyond basic CRUD operations:
-- Designed a full-stack application with a React frontend and Spring Boot backend.
-- Implemented outbound HTTP request execution for multiple HTTP methods (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`).
-- Built persistent request collections, environments, and execution history.
-- Implemented SSRF defenses using DNS validation, socket connection checking, and redirect destination checks.
-- Added sensitive-data redaction for query parameters, headers, and JSON request bodies before request history persistence.
-- Developed automated backend and frontend tests.
-- Configured Docker-based development and CI workflow infrastructure.
-
----
-
-## Known Limitations and Future Improvements
-
-The project is a portfolio and learning application, not a claim of enterprise production readiness.
-
-Potential improvements include:
-- Protect environment secrets from being exposed through API responses (e.g. server-side vault integration or write-merge masking).
-- Implement backend-aware request cancellation (e.g. reactive Spring WebFlux pipelines or servlet async cancellation hooks).
-- Expand secret redaction to additional body formats (e.g. XML, GraphQL, multipart form-data).
-- Verify the complete application against a live MySQL 8 instance.
-- Validate the GitHub Actions workflow through a successful hosted run.
-- Add more integration and end-to-end tests.
-- Add screenshots and a short application demo video.
+### Step 2: Deploy Backend to Render
+1. Log in to [Render Dashboard](https://dashboard.render.com).
+2. Click **New +** -> **Web Service**.
+3. Connect your GitHub repository `mdsaifswe/api-testing-playground`.
+4. Configure service parameters:
+   - **Name:** `api-testing-playground-backend`
+   - **Root Directory:** *(leave blank or `backend`)*
+   - **Runtime:** `Docker` (Render automatically uses `backend/Dockerfile`)
+   - **Instance Type:** `Free`
+5. Configure Environment Variables in Render:
+   - `SPRING_PROFILES_ACTIVE`: `postgres`
+   - `SPRING_DATASOURCE_URL`: `jdbc:postgresql://<neon-host>/<dbname>?sslmode=require`
+   - `SPRING_DATASOURCE_USERNAME`: `<neon-username>`
+   - `SPRING_DATASOURCE_PASSWORD`: `<neon-password>`
+   - `PLAYGROUND_CORS_ALLOWED_ORIGINS`: `https://<your-project>.pages.dev` *(update after Step 3)*
+   - `PLAYGROUND_ALLOW_LOOPBACK`: `false`
+   - `PLAYGROUND_ALLOW_PRIVATE_IPS`: `false`
+6. Deploy the web service. Render will assign an HTTPS URL:
+   `https://api-testing-playground-backend.onrender.com`
+7. Verify deployment:
+   ```bash
+   curl https://api-testing-playground-backend.onrender.com/api/v1/health
+   ```
 
 ---
 
-## Resume Highlights
+### Step 3: Deploy Frontend to Cloudflare Pages
+1. Log in to [Cloudflare Dashboard](https://dash.cloudflare.com) and navigate to **Workers & Pages**.
+2. Click **Create application** -> **Pages** -> **Connect to Git**.
+3. Select `mdsaifswe/api-testing-playground`.
+4. Configure Build settings:
+   - **Framework preset:** `Vite`
+   - **Build command:** `npm run build`
+   - **Build output directory:** `dist`
+   - **Root directory:** `frontend`
+5. Configure Environment Variable:
+   - `VITE_API_URL`: `https://api-testing-playground-backend.onrender.com`
+6. Click **Save and Deploy**.
+7. Cloudflare Pages assigns a domain: `https://<your-project>.pages.dev`.
+8. **Final Step:** Copy your Cloudflare Pages domain and paste it into Render's `PLAYGROUND_CORS_ALLOWED_ORIGINS` environment variable.
 
-**API Testing Playground | Full-Stack Development Project**
-- Built a full-stack API testing platform using React, TypeScript, Java 17, and Spring Boot 3, supporting `GET`, `POST`, `PUT`, `PATCH`, and `DELETE` requests.
-- Implemented request collections, environment variables, execution history, and response inspection with persistent database storage.
-- Developed backend SSRF protections, DNS validation, secure redirect handling, and sensitive-data redaction.
-- Added automated backend and frontend tests using JUnit 5, Mockito, Vitest, and React Testing Library.
-- Configured Docker-based deployment infrastructure and GitHub Actions CI workflow.
+---
+
+## Known Security Limitations & Operational Boundaries
+
+1. **Anonymous Workspace Persistence:** Workspace credentials (`wpk_...`) are stored in browser `localStorage`. Clearing browser data or opening the site in a private/incognito window creates a new workspace. Anonymous workspaces intentionally do not provide account recovery or cross-device synchronization.
+2. **In-Memory Rate Limiting:** Rate limiting uses a single-instance token bucket suitable for single-node deployments (e.g., Render Free). In a horizontally scaled cluster, rate limits are enforced per instance unless backed by a distributed cache like Redis.
+3. **Outbound Network Scope:** Public deployment is intended for testing public HTTP/HTTPS APIs. Outbound connections to private corporate intranets, localhost, and cloud metadata services are intentionally blocked by design.
 
 ---
 
@@ -257,6 +272,4 @@ Potential improvements include:
 
 **Md. Saif**
 - GitHub: [@mdsaifswe](https://github.com/mdsaifswe)
-- Project Repository: [api-testing-playground](https://github.com/mdsaifswe/api-testing-playground)
-
-*Built to demonstrate practical full-stack development, API engineering, automated testing, and security-conscious backend design.*
+- Repository: [api-testing-playground](https://github.com/mdsaifswe/api-testing-playground)

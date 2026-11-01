@@ -2,7 +2,9 @@ package com.playground.api.service;
 
 import com.playground.api.entity.EnvironmentEntity;
 import com.playground.api.entity.EnvironmentVariableEntity;
+import com.playground.api.entity.WorkspaceEntity;
 import com.playground.api.repository.EnvironmentRepository;
+import com.playground.api.security.WorkspaceContextHolder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -66,12 +68,24 @@ public class VariableSubstitutionService {
 
     @Transactional(readOnly = true)
     public Map<String, String> getVariablesMap(Long environmentId) {
+        WorkspaceEntity workspace = WorkspaceContextHolder.get();
         EnvironmentEntity env = null;
-        if (environmentId != null) {
-            env = environmentRepository.findById(environmentId).orElse(null);
-        }
-        if (env == null) {
-            env = environmentRepository.findByIsActiveTrue().orElse(null);
+
+        if (workspace != null) {
+            if (environmentId != null) {
+                env = environmentRepository.findByIdAndWorkspaceId(environmentId, workspace.getId()).orElse(null);
+            }
+            if (env == null) {
+                env = environmentRepository.findByWorkspaceIdAndIsActiveTrue(workspace.getId()).orElse(null);
+            }
+        } else {
+            // Standalone or unauthenticated context fallback
+            if (environmentId != null) {
+                env = environmentRepository.findById(environmentId).orElse(null);
+            }
+            if (env == null) {
+                env = environmentRepository.findByIsActiveTrue().orElse(null);
+            }
         }
 
         if (env == null || env.getVariables() == null) {

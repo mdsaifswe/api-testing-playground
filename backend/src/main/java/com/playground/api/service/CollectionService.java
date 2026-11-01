@@ -10,8 +10,10 @@ import com.playground.api.dto.response.CollectionResponseDto;
 import com.playground.api.dto.response.SavedRequestResponseDto;
 import com.playground.api.entity.CollectionEntity;
 import com.playground.api.entity.SavedRequestEntity;
+import com.playground.api.entity.WorkspaceEntity;
 import com.playground.api.exception.ResourceNotFoundException;
 import com.playground.api.repository.CollectionRepository;
+import com.playground.api.security.WorkspaceContextHolder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -31,7 +33,8 @@ public class CollectionService {
 
     @Transactional(readOnly = true)
     public List<CollectionResponseDto> getAllCollections() {
-        return collectionRepository.findAllByOrderByCreatedAtDesc()
+        WorkspaceEntity workspace = WorkspaceContextHolder.requireCurrent();
+        return collectionRepository.findByWorkspaceIdOrderByCreatedAtDesc(workspace.getId())
                 .stream()
                 .map(this::mapToDto)
                 .collect(Collectors.toList());
@@ -39,14 +42,17 @@ public class CollectionService {
 
     @Transactional(readOnly = true)
     public CollectionResponseDto getCollectionById(Long id) {
-        CollectionEntity entity = collectionRepository.findById(id)
+        WorkspaceEntity workspace = WorkspaceContextHolder.requireCurrent();
+        CollectionEntity entity = collectionRepository.findByIdAndWorkspaceId(id, workspace.getId())
                 .orElseThrow(() -> new ResourceNotFoundException("Collection not found with id: " + id));
         return mapToDto(entity);
     }
 
     @Transactional
     public CollectionResponseDto createCollection(CreateCollectionDto dto) {
+        WorkspaceEntity workspace = WorkspaceContextHolder.requireCurrent();
         CollectionEntity entity = CollectionEntity.builder()
+                .workspace(workspace)
                 .name(dto.getName())
                 .description(dto.getDescription())
                 .build();
@@ -56,7 +62,8 @@ public class CollectionService {
 
     @Transactional
     public CollectionResponseDto updateCollection(Long id, UpdateCollectionDto dto) {
-        CollectionEntity entity = collectionRepository.findById(id)
+        WorkspaceEntity workspace = WorkspaceContextHolder.requireCurrent();
+        CollectionEntity entity = collectionRepository.findByIdAndWorkspaceId(id, workspace.getId())
                 .orElseThrow(() -> new ResourceNotFoundException("Collection not found with id: " + id));
 
         entity.setName(dto.getName());
@@ -67,10 +74,10 @@ public class CollectionService {
 
     @Transactional
     public void deleteCollection(Long id) {
-        if (!collectionRepository.existsById(id)) {
-            throw new ResourceNotFoundException("Collection not found with id: " + id);
-        }
-        collectionRepository.deleteById(id);
+        WorkspaceEntity workspace = WorkspaceContextHolder.requireCurrent();
+        CollectionEntity entity = collectionRepository.findByIdAndWorkspaceId(id, workspace.getId())
+                .orElseThrow(() -> new ResourceNotFoundException("Collection not found with id: " + id));
+        collectionRepository.delete(entity);
     }
 
     public CollectionResponseDto mapToDto(CollectionEntity entity) {
@@ -117,6 +124,7 @@ public class CollectionService {
         try {
             return objectMapper.readValue(json, typeRef);
         } catch (Exception e) {
+            log.warn("Failed to deserialize JSON list from collection request: {}", e.getMessage());
             return Collections.emptyList();
         }
     }
@@ -128,6 +136,7 @@ public class CollectionService {
         try {
             return objectMapper.readValue(json, clazz);
         } catch (Exception e) {
+            log.warn("Failed to deserialize JSON object: {}", e.getMessage());
             return null;
         }
     }

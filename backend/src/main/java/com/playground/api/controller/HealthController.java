@@ -4,6 +4,7 @@ import com.playground.api.dto.response.HealthResponseDto;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -15,6 +16,7 @@ import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
+@Slf4j
 @RestController
 @RequestMapping("/api/v1/health")
 @RequiredArgsConstructor
@@ -28,18 +30,15 @@ public class HealthController {
     public ResponseEntity<HealthResponseDto> checkHealth() {
         Map<String, Object> details = new LinkedHashMap<>();
 
-        // Check database connection
+        // Check database connection without exposing internal database details or exception messages to anonymous callers
         boolean dbHealthy = false;
-        String dbProduct = "Unknown";
         try (Connection conn = dataSource.getConnection()) {
             dbHealthy = conn.isValid(2);
-            dbProduct = conn.getMetaData().getDatabaseProductName() + " " + conn.getMetaData().getDatabaseProductVersion();
         } catch (Exception e) {
-            details.put("dbError", e.getMessage());
+            log.error("Database connectivity check failed during health ping: {}", e.getMessage(), e);
         }
 
         details.put("databaseConnected", dbHealthy);
-        details.put("databaseType", dbProduct);
 
         Runtime runtime = Runtime.getRuntime();
         long totalMemory = runtime.totalMemory() / (1024 * 1024);

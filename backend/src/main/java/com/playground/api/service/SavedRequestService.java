@@ -6,9 +6,11 @@ import com.playground.api.dto.request.SaveRequestDto;
 import com.playground.api.dto.response.SavedRequestResponseDto;
 import com.playground.api.entity.CollectionEntity;
 import com.playground.api.entity.SavedRequestEntity;
+import com.playground.api.entity.WorkspaceEntity;
 import com.playground.api.exception.ResourceNotFoundException;
 import com.playground.api.repository.CollectionRepository;
 import com.playground.api.repository.SavedRequestRepository;
+import com.playground.api.security.WorkspaceContextHolder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -29,7 +31,8 @@ public class SavedRequestService {
 
     @Transactional(readOnly = true)
     public List<SavedRequestResponseDto> getAllRequests() {
-        return savedRequestRepository.findAllByOrderByCreatedAtDesc()
+        WorkspaceEntity workspace = WorkspaceContextHolder.requireCurrent();
+        return savedRequestRepository.findByWorkspaceIdOrderByCreatedAtDesc(workspace.getId())
                 .stream()
                 .map(collectionService::mapRequestToDto)
                 .collect(Collectors.toList());
@@ -37,7 +40,8 @@ public class SavedRequestService {
 
     @Transactional(readOnly = true)
     public List<SavedRequestResponseDto> getRequestsByCollection(Long collectionId) {
-        return savedRequestRepository.findByCollectionIdOrderByCreatedAtDesc(collectionId)
+        WorkspaceEntity workspace = WorkspaceContextHolder.requireCurrent();
+        return savedRequestRepository.findByCollectionIdAndWorkspaceIdOrderByCreatedAtDesc(collectionId, workspace.getId())
                 .stream()
                 .map(collectionService::mapRequestToDto)
                 .collect(Collectors.toList());
@@ -45,16 +49,18 @@ public class SavedRequestService {
 
     @Transactional(readOnly = true)
     public SavedRequestResponseDto getRequestById(Long id) {
-        SavedRequestEntity entity = savedRequestRepository.findById(id)
+        WorkspaceEntity workspace = WorkspaceContextHolder.requireCurrent();
+        SavedRequestEntity entity = savedRequestRepository.findByIdAndWorkspaceId(id, workspace.getId())
                 .orElseThrow(() -> new ResourceNotFoundException("Saved request not found with id: " + id));
         return collectionService.mapRequestToDto(entity);
     }
 
     @Transactional
     public SavedRequestResponseDto saveRequest(SaveRequestDto dto) {
+        WorkspaceEntity workspace = WorkspaceContextHolder.requireCurrent();
         CollectionEntity collection = null;
         if (dto.getCollectionId() != null) {
-            collection = collectionRepository.findById(dto.getCollectionId())
+            collection = collectionRepository.findByIdAndWorkspaceId(dto.getCollectionId(), workspace.getId())
                     .orElseThrow(() -> new ResourceNotFoundException("Collection not found with id: " + dto.getCollectionId()));
         }
 
@@ -66,6 +72,7 @@ public class SavedRequestService {
                 : "NONE";
 
         SavedRequestEntity entity = SavedRequestEntity.builder()
+                .workspace(workspace)
                 .collection(collection)
                 .name(dto.getName())
                 .method(dto.getMethod().toUpperCase())
@@ -83,11 +90,12 @@ public class SavedRequestService {
 
     @Transactional
     public SavedRequestResponseDto updateRequest(Long id, SaveRequestDto dto) {
-        SavedRequestEntity entity = savedRequestRepository.findById(id)
+        WorkspaceEntity workspace = WorkspaceContextHolder.requireCurrent();
+        SavedRequestEntity entity = savedRequestRepository.findByIdAndWorkspaceId(id, workspace.getId())
                 .orElseThrow(() -> new ResourceNotFoundException("Saved request not found with id: " + id));
 
         if (dto.getCollectionId() != null) {
-            CollectionEntity collection = collectionRepository.findById(dto.getCollectionId())
+            CollectionEntity collection = collectionRepository.findByIdAndWorkspaceId(dto.getCollectionId(), workspace.getId())
                     .orElseThrow(() -> new ResourceNotFoundException("Collection not found with id: " + dto.getCollectionId()));
             entity.setCollection(collection);
         } else {
@@ -111,10 +119,12 @@ public class SavedRequestService {
 
     @Transactional
     public SavedRequestResponseDto duplicateRequest(Long id) {
-        SavedRequestEntity original = savedRequestRepository.findById(id)
+        WorkspaceEntity workspace = WorkspaceContextHolder.requireCurrent();
+        SavedRequestEntity original = savedRequestRepository.findByIdAndWorkspaceId(id, workspace.getId())
                 .orElseThrow(() -> new ResourceNotFoundException("Saved request not found with id: " + id));
 
         SavedRequestEntity clone = SavedRequestEntity.builder()
+                .workspace(workspace)
                 .collection(original.getCollection())
                 .name(original.getName() + " (Copy)")
                 .method(original.getMethod())
@@ -132,10 +142,10 @@ public class SavedRequestService {
 
     @Transactional
     public void deleteRequest(Long id) {
-        if (!savedRequestRepository.existsById(id)) {
-            throw new ResourceNotFoundException("Saved request not found with id: " + id);
-        }
-        savedRequestRepository.deleteById(id);
+        WorkspaceEntity workspace = WorkspaceContextHolder.requireCurrent();
+        SavedRequestEntity entity = savedRequestRepository.findByIdAndWorkspaceId(id, workspace.getId())
+                .orElseThrow(() -> new ResourceNotFoundException("Saved request not found with id: " + id));
+        savedRequestRepository.delete(entity);
     }
 
     private String serialize(Object obj) {

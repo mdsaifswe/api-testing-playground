@@ -10,12 +10,19 @@ import com.playground.api.dto.common.AuthDto;
 import com.playground.api.dto.common.KeyValueDto;
 import com.playground.api.dto.request.ExecuteRequestDto;
 import com.playground.api.dto.response.ExecutionResponseDto;
+import com.playground.api.entity.EnvironmentEntity;
+import com.playground.api.entity.EnvironmentVariableEntity;
 import com.playground.api.entity.RequestHistoryEntity;
+import com.playground.api.entity.WorkspaceEntity;
 import com.playground.api.exception.InvalidRequestException;
+import com.playground.api.exception.ResourceNotFoundException;
 import com.playground.api.exception.SsrfSecurityException;
+import com.playground.api.repository.EnvironmentRepository;
+import com.playground.api.repository.EnvironmentVariableRepository;
 import com.playground.api.repository.RequestHistoryRepository;
 import com.playground.api.security.SafeDnsResolver;
 import com.playground.api.security.SsrfValidator;
+import com.playground.api.security.WorkspaceContextHolder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.hc.client5.http.classic.methods.*;
@@ -30,9 +37,12 @@ import org.apache.hc.core5.http.HttpEntity;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.http.io.entity.StringEntity;
 import org.apache.hc.core5.util.Timeout;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URLDecoder;
@@ -46,12 +56,21 @@ import java.util.*;
 @RequiredArgsConstructor
 public class RequestExecutionService {
 
+    public static final int HARD_MAX_TIMEOUT_MS = 15_000; // Hard ceiling of 15 seconds
+    public static final int DEFAULT_TIMEOUT_MS = 10_000;
+
     private final SsrfValidator ssrfValidator;
     private final SafeDnsResolver safeDnsResolver;
     private final VariableSubstitutionService substitutionService;
     private final RequestHistoryRepository historyRepository;
     private final PlaygroundSecurityProperties properties;
     private final ObjectMapper objectMapper;
+
+    @Autowired(required = false)
+    private EnvironmentRepository environmentRepository;
+
+    @Autowired(required = false)
+    private EnvironmentVariableRepository variableRepository;
 
     public static final Set<String> SENSITIVE_PARAM_NAMES = Set.of(
             "apikey", "api_key", "api-key",
@@ -94,8 +113,16 @@ public class RequestExecutionService {
         long startNano = System.nanoTime();
         long durationMs = 0;
 
-        // 1. Resolve environment variables if environment is specified or active
+        // 0. Verify workspace authorization for environment if specified
         Long envId = requestDto.getEnvironmentId();
+        WorkspaceEntity currentWorkspace = WorkspaceContextHolder.get();
+        if (envId != null && currentWorkspace != null && environmentRepository != null) {
+            if (!environmentRepository.existsByIdAndWorkspaceId(envId, currentWorkspace.getId())) {
+                throw new ResourceNotFoundException("Environment not found with id: " + envId);
+            }
+        }
+
+        // 1. Resolve environment variables if environment is specified or active
         String resolvedUrl = substitutionService.substitute(requestDto.getUrl(), envId);
         String resolvedBody = substitutionService.substitute(requestDto.getBody(), envId);
 
@@ -110,7 +137,7 @@ public class RequestExecutionService {
             durationMs = (System.nanoTime() - startNano) / 1_000_000L;
             log.warn("SSRF security violation blocked for URL {}: {}", redactSensitiveUrl(fullUrl), e.getMessage());
             RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
-                    resolvedBody, 403, "Forbidden", Collections.emptyMap(), e.getMessage(), 0, durationMs, "SECURITY_VIOLATION");
+                    resolvedBody, 403, "Forbidden", Collections.emptyMap(), e.getMessage(), 0, durationMs, "SECURITY_VIOLATION", envId);
 
             return ExecutionResponseDto.builder()
                     .statusCode(403)
@@ -125,15 +152,15 @@ public class RequestExecutionService {
                     .build();
         }
 
-        // 4. Configure timeouts and disable automatic redirect following (we handle redirects manually with hop-by-hop SSRF validation)
-        int timeoutMs = requestDto.getTimeoutMs() != null && requestDto.getTimeoutMs() > 0
-                ? requestDto.getTimeoutMs()
-                : properties.getReadTimeoutMs();
+        // 4. Configure timeouts with hard 15-second cap and disable automatic redirect following
+        int timeoutMs = resolveTimeout(requestDto.getTimeoutMs());
+        int connectTimeoutMs = resolveConnectTimeout();
+        long deadlineNano = startNano + (timeoutMs * 1_000_000L);
 
         RequestConfig requestConfig = RequestConfig.custom()
-                .setConnectTimeout(Timeout.ofMilliseconds(properties.getConnectTimeoutMs()))
+                .setConnectTimeout(Timeout.ofMilliseconds(connectTimeoutMs))
                 .setResponseTimeout(Timeout.ofMilliseconds(timeoutMs))
-                .setConnectionRequestTimeout(Timeout.ofMilliseconds(properties.getConnectTimeoutMs()))
+                .setConnectionRequestTimeout(Timeout.ofMilliseconds(connectTimeoutMs))
                 .setRedirectsEnabled(false) // Strict hop-by-hop manual validation
                 .build();
 
@@ -157,7 +184,23 @@ public class RequestExecutionService {
                 CloseableHttpResponse response = null;
                 try {
                     while (true) {
+                        long elapsedMs = (System.nanoTime() - startNano) / 1_000_000L;
+                        long remainingMs = timeoutMs - elapsedMs;
+                        if (remainingMs <= 0) {
+                            throw new SocketTimeoutException("Overall request deadline of " + timeoutMs + "ms exceeded.");
+                        }
+
+                        int hopConnectTimeout = Math.min(connectTimeoutMs, (int) Math.max(1, remainingMs));
+                        int hopResponseTimeout = (int) Math.max(1, remainingMs);
+                        RequestConfig hopConfig = RequestConfig.custom()
+                                .setConnectTimeout(Timeout.ofMilliseconds(hopConnectTimeout))
+                                .setResponseTimeout(Timeout.ofMilliseconds(hopResponseTimeout))
+                                .setConnectionRequestTimeout(Timeout.ofMilliseconds(hopConnectTimeout))
+                                .setRedirectsEnabled(false)
+                                .build();
+
                         HttpUriRequestBase httpRequest = createHttpRequest(currentMethod, currentUri);
+                        httpRequest.setConfig(hopConfig);
 
                         // Cross-origin check: strip sensitive headers and credentials if redirect destination has a different origin
                         boolean isCrossOrigin = !isSameOrigin(targetUri, currentUri);
@@ -235,21 +278,15 @@ public class RequestExecutionService {
 
                     HttpEntity entity = response.getEntity();
                     if (entity != null) {
-                        byte[] bytes = EntityUtils.toByteArray(entity);
-                        responseSize = bytes.length;
-
-                        // Enforce size limit
-                        if (responseSize > properties.getMaxResponseSizeBytes()) {
-                            responseBody = "[Response payload exceeded limit of " + properties.getMaxResponseSizeBytes() + " bytes]";
-                        } else {
-                            responseBody = new String(bytes, StandardCharsets.UTF_8);
-                        }
+                        BoundedReadResult readResult = readBoundedBody(entity.getContent(), properties.getMaxResponseSizeBytes(), deadlineNano);
+                        responseBody = readResult.getBody();
+                        responseSize = readResult.getSizeBytes();
                     }
 
                     String errorCategory = (statusCode >= 200 && statusCode < 400) ? "SUCCESS" : "HTTP_ERROR";
 
                     RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
-                            resolvedBody, statusCode, statusText, responseHeaders, responseBody, responseSize, durationMs, errorCategory);
+                            resolvedBody, statusCode, statusText, responseHeaders, responseBody, responseSize, durationMs, errorCategory, envId);
 
                     return ExecutionResponseDto.builder()
                             .statusCode(statusCode)
@@ -276,7 +313,7 @@ public class RequestExecutionService {
             durationMs = (System.nanoTime() - startNano) / 1_000_000L;
             log.warn("SSRF security policy blocked redirect/request: {}", e.getMessage());
             RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
-                    resolvedBody, 403, "Forbidden", Collections.emptyMap(), e.getMessage(), 0, durationMs, "SECURITY_VIOLATION");
+                    resolvedBody, 403, "Forbidden", Collections.emptyMap(), e.getMessage(), 0, durationMs, "SECURITY_VIOLATION", envId);
 
             return ExecutionResponseDto.builder()
                     .statusCode(403)
@@ -295,7 +332,7 @@ public class RequestExecutionService {
             log.warn("Request timed out after {}ms: {}", durationMs, redactSensitiveUrl(fullUrl));
 
             RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
-                    resolvedBody, 504, "Gateway Timeout", Collections.emptyMap(), "Request timed out after " + timeoutMs + "ms", 0, durationMs, "TIMEOUT");
+                    resolvedBody, 504, "Gateway Timeout", Collections.emptyMap(), "Request timed out after " + timeoutMs + "ms", 0, durationMs, "TIMEOUT", envId);
 
             return ExecutionResponseDto.builder()
                     .statusCode(504)
@@ -319,7 +356,7 @@ public class RequestExecutionService {
             String errorMsg = isSsrf ? e.getMessage() : "Could not resolve or connect to target host: " + e.getMessage();
 
             RequestHistoryEntity history = recordHistory(requestDto.getMethod(), fullUrl, requestDto.getHeaders(),
-                    resolvedBody, statusCode, statusText, Collections.emptyMap(), errorMsg, 0, durationMs, category);
+                    resolvedBody, statusCode, statusText, Collections.emptyMap(), errorMsg, 0, durationMs, category, envId);
 
             return ExecutionResponseDto.builder()
                     .statusCode(statusCode)
@@ -682,14 +719,23 @@ public class RequestExecutionService {
                                               String body, Integer status, String statusText,
                                               Map<String, String> responseHeaders, String responseBody,
                                               long responseSize, long durationMs, String errorCategory) {
+        return recordHistory(method, url, headers, body, status, statusText, responseHeaders, responseBody, responseSize, durationMs, errorCategory, null);
+    }
+
+    private RequestHistoryEntity recordHistory(String method, String url, List<KeyValueDto> headers,
+                                              String body, Integer status, String statusText,
+                                              Map<String, String> responseHeaders, String responseBody,
+                                              long responseSize, long durationMs, String errorCategory, Long envId) {
         try {
-            String safeUrl = redactSensitiveUrl(url);
+            WorkspaceEntity workspace = WorkspaceContextHolder.get();
+            String safeUrl = redactEnvironmentSecrets(redactSensitiveUrl(url), envId);
             List<KeyValueDto> safeHeaders = redactSensitiveHeaders(headers);
-            String safeBody = redactSensitiveJson(body);
+            String safeBody = redactEnvironmentSecrets(redactSensitiveJson(body), envId);
             String headersJson = safeHeaders != null ? objectMapper.writeValueAsString(safeHeaders) : "[]";
             String respHeadersJson = responseHeaders != null ? objectMapper.writeValueAsString(responseHeaders) : "{}";
 
             RequestHistoryEntity entity = RequestHistoryEntity.builder()
+                    .workspace(workspace)
                     .method(method)
                     .url(safeUrl)
                     .requestHeaders(headersJson)
@@ -707,10 +753,12 @@ public class RequestExecutionService {
             return historyRepository.save(entity);
         } catch (JsonProcessingException e) {
             log.error("Failed to serialize history metadata: {}", e.getMessage());
+            WorkspaceEntity workspace = WorkspaceContextHolder.get();
             RequestHistoryEntity fallback = RequestHistoryEntity.builder()
+                    .workspace(workspace)
                     .method(method)
-                    .url(redactSensitiveUrl(url))
-                    .requestBody(redactSensitiveJson(body))
+                    .url(redactEnvironmentSecrets(redactSensitiveUrl(url), envId))
+                    .requestBody(redactEnvironmentSecrets(redactSensitiveJson(body), envId))
                     .responseStatus(status)
                     .responseStatusText(statusText)
                     .durationMs(durationMs)
@@ -718,6 +766,117 @@ public class RequestExecutionService {
                     .executedAt(Instant.now())
                     .build();
             return historyRepository.save(fallback);
+        }
+    }
+
+    private String redactEnvironmentSecrets(String text, Long envId) {
+        if (text == null || text.isEmpty() || variableRepository == null) {
+            return text;
+        }
+        try {
+            Long targetEnvId = envId;
+            if (targetEnvId == null) {
+                WorkspaceEntity ws = WorkspaceContextHolder.get();
+                if (ws != null && environmentRepository != null) {
+                    targetEnvId = environmentRepository.findByWorkspaceIdAndIsActiveTrue(ws.getId())
+                            .map(EnvironmentEntity::getId).orElse(null);
+                }
+            }
+            if (targetEnvId != null) {
+                List<EnvironmentVariableEntity> vars = variableRepository.findByEnvironmentId(targetEnvId);
+                for (EnvironmentVariableEntity v : vars) {
+                    if (Boolean.TRUE.equals(v.getIsSecret()) && v.getValue() != null && v.getValue().length() >= 3) {
+                        text = text.replace(v.getValue(), "[REDACTED]");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Failed to redact environment secrets from history: {}", e.getMessage());
+        }
+        return text;
+    }
+
+    /**
+     * Resolves and bounds outbound timeout to ensure it never exceeds HARD_MAX_TIMEOUT_MS (15,000ms).
+     * Non-positive, zero, or null timeouts safely fallback to configured read timeout or default, capped at 15,000ms.
+     */
+    public int resolveTimeout(Integer requestedTimeoutMs) {
+        if (requestedTimeoutMs == null || requestedTimeoutMs <= 0) {
+            int defaultTimeout = properties.getReadTimeoutMs() > 0 ? properties.getReadTimeoutMs() : DEFAULT_TIMEOUT_MS;
+            return Math.min(defaultTimeout, HARD_MAX_TIMEOUT_MS);
+        }
+        return Math.min(requestedTimeoutMs, HARD_MAX_TIMEOUT_MS);
+    }
+
+    public int resolveConnectTimeout() {
+        int defaultTimeout = properties.getConnectTimeoutMs() > 0 ? properties.getConnectTimeoutMs() : DEFAULT_TIMEOUT_MS;
+        return Math.min(defaultTimeout, HARD_MAX_TIMEOUT_MS);
+    }
+
+    public static class BoundedReadResult {
+        private final String body;
+        private final long sizeBytes;
+        private final boolean exceeded;
+
+        public BoundedReadResult(String body, long sizeBytes, boolean exceeded) {
+            this.body = body;
+            this.sizeBytes = sizeBytes;
+            this.exceeded = exceeded;
+        }
+
+        public String getBody() {
+            return body;
+        }
+
+        public long getSizeBytes() {
+            return sizeBytes;
+        }
+
+        public boolean isExceeded() {
+            return exceeded;
+        }
+    }
+
+    /**
+     * Reads up to maxBytes from the response input stream without an overall deadline.
+     */
+    public BoundedReadResult readBoundedBody(InputStream in, long maxBytes) throws IOException {
+        return readBoundedBody(in, maxBytes, -1L);
+    }
+
+    /**
+     * Reads up to maxBytes from the response input stream while strictly enforcing the overall deadline.
+     * If the response exceeds maxBytes or exceeds the deadline, reading terminates immediately and the stream is closed.
+     */
+    public BoundedReadResult readBoundedBody(InputStream in, long maxBytes, long deadlineNano) throws IOException {
+        if (in == null) {
+            return new BoundedReadResult("", 0, false);
+        }
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        byte[] chunk = new byte[8192];
+        long totalRead = 0;
+        boolean exceeded = false;
+
+        try (in) {
+            int bytesRead;
+            while ((bytesRead = in.read(chunk)) != -1) {
+                if (deadlineNano > 0 && System.nanoTime() > deadlineNano) {
+                    throw new SocketTimeoutException("Overall request deadline exceeded while reading response stream.");
+                }
+                totalRead += bytesRead;
+                if (totalRead > maxBytes) {
+                    exceeded = true;
+                    break;
+                }
+                buffer.write(chunk, 0, bytesRead);
+            }
+        }
+
+        if (exceeded) {
+            return new BoundedReadResult("[Response payload exceeded limit of " + maxBytes + " bytes]", totalRead, true);
+        } else {
+            byte[] bytes = buffer.toByteArray();
+            return new BoundedReadResult(new String(bytes, StandardCharsets.UTF_8), bytes.length, false);
         }
     }
 }

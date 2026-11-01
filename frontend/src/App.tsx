@@ -84,6 +84,7 @@ export const App: React.FC = () => {
     }
 
     try {
+      await playgroundApi.initWorkspace();
       const [colData, histData, envData, activeEnvData] = await Promise.all([
         playgroundApi.getCollections(),
         playgroundApi.getHistory(),

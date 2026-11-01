@@ -28,4 +28,8 @@ ENV DB_NAME=api_testing_playground
 ENV DB_USER=root
 ENV DB_PASSWORD=root
 
-ENTRYPOINT ["java", "-jar", "app.jar"]
+# Container-aware JVM memory strategy for 512MB instances (Render Free Tier):
+# MaxRAMPercentage=70.0 reserves ~358MB heap, leaving ~154MB for Metaspace, GC threads, and OS.
+ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=70.0 -XX:+ExitOnOutOfMemoryError"
+
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar app.jar"]

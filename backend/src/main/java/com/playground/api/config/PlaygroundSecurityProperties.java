@@ -13,14 +13,16 @@ import lombok.Setter;
 public class PlaygroundSecurityProperties {
 
     /**
-     * Whether loopback addresses (127.0.0.1, localhost) are permitted.
-     * True by default in local dev so that the user can test the built-in echo endpoints.
-     * Can be set to false in strict public cloud deployments.
+     * Whether loopback addresses (127.0.0.1, localhost, ::1) are permitted.
+     * True by default for local development so that developers can test built-in echo endpoints.
+     * Overridden to false in production profiles (e.g. application-postgres.yml).
      */
     private boolean allowLoopback = true;
 
     /**
      * Whether RFC 1918 private IP ranges are permitted.
+     * True by default for local development.
+     * Overridden to false in production profiles (e.g. application-postgres.yml).
      */
     private boolean allowPrivateIps = true;
 

@@ -1,5 +1,5 @@
 server:
-  port: 8080
+  port: ${PORT:8080}
   shutdown: graceful
 
 spring:
@@ -17,7 +17,6 @@ spring:
     properties:
       hibernate:
         format_sql: false
-        dialect: org.hibernate.dialect.H2Dialect
   flyway:
     enabled: true
     baseline-on-migrate: true
@@ -31,9 +30,11 @@ springdoc:
     operationsSorter: method
 
 playground:
+  cors:
+    allowed-origins: ${PLAYGROUND_CORS_ALLOWED_ORIGINS:http://localhost:[*],http://127.0.0.1:[*],http://localhost,https://localhost:[*]}
   security:
-    allow-loopback: ${PLAYGROUND_ALLOW_LOOPBACK:true} # Allowed for echo endpoints & local testing, configurable
-    allow-private-ips: ${PLAYGROUND_ALLOW_PRIVATE_IPS:true} # Configurable for local subnet / enterprise test endpoints
+    allow-loopback: ${PLAYGROUND_ALLOW_LOOPBACK:true} # Local development default: true (allows echo endpoints & local testing out-of-the-box)
+    allow-private-ips: ${PLAYGROUND_ALLOW_PRIVATE_IPS:true} # Local development default: true
     max-redirects: 5
     connect-timeout-ms: 10000
     read-timeout-ms: 30000

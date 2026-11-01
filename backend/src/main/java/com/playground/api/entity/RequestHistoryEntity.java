@@ -18,6 +18,10 @@ public class RequestHistoryEntity {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "workspace_id")
+    private WorkspaceEntity workspace;
+
     @Column(nullable = false, length = 10)
     private String method;
 
@@ -27,7 +31,7 @@ public class RequestHistoryEntity {
     @Column(name = "request_headers", columnDefinition = "TEXT")
     private String requestHeaders;
 
-    @Column(name = "request_body", columnDefinition = "LONGTEXT")
+    @Column(name = "request_body", columnDefinition = "TEXT")
     private String requestBody;
 
     @Column(name = "response_status")
@@ -39,7 +43,7 @@ public class RequestHistoryEntity {
     @Column(name = "response_headers", columnDefinition = "TEXT")
     private String responseHeaders;
 
-    @Column(name = "response_body", columnDefinition = "LONGTEXT")
+    @Column(name = "response_body", columnDefinition = "TEXT")
     private String responseBody;
 
     @Column(name = "response_size")

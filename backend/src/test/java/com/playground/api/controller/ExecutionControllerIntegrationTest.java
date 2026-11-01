@@ -17,6 +17,11 @@ import org.springframework.test.web.servlet.MockMvc;
 
 import java.util.List;
 
+import com.playground.api.dto.request.CreateWorkspaceDto;
+import com.playground.api.dto.response.WorkspaceResponseDto;
+import com.playground.api.service.WorkspaceService;
+import org.junit.jupiter.api.BeforeEach;
+
 import static org.hamcrest.Matchers.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
@@ -31,13 +36,27 @@ class ExecutionControllerIntegrationTest {
     @Autowired
     private ObjectMapper objectMapper;
 
+    @Autowired
+    private WorkspaceService workspaceService;
+
+    private String testWorkspaceKey;
+
+    @BeforeEach
+    void setUp() {
+        WorkspaceResponseDto ws = workspaceService.createWorkspace(new CreateWorkspaceDto("Test WS"));
+        testWorkspaceKey = ws.getWorkspaceKey();
+    }
+
     @Test
-    @DisplayName("Health endpoint should report UP status")
+    @DisplayName("Health endpoint should report UP status and sanitized details without internal database vendor or error exposure")
     void testHealthEndpoint() throws Exception {
         mockMvc.perform(get("/api/v1/health"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("UP"))
-                .andExpect(jsonPath("$.service").value("api-testing-playground-backend"));
+                .andExpect(jsonPath("$.service").value("api-testing-playground-backend"))
+                .andExpect(jsonPath("$.details.databaseConnected").value(true))
+                .andExpect(jsonPath("$.details.databaseType").doesNotExist())
+                .andExpect(jsonPath("$.details.dbError").doesNotExist());
     }
 
     @Test
@@ -102,13 +121,15 @@ class ExecutionControllerIntegrationTest {
                 .build();
 
         mockMvc.perform(post("/api/v1/collections")
+                        .header("X-Workspace-Key", testWorkspaceKey)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(createDto)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.id").isNumber())
                 .andExpect(jsonPath("$.name").value("Integration Test Collection"));
 
-        mockMvc.perform(get("/api/v1/collections"))
+        mockMvc.perform(get("/api/v1/collections")
+                        .header("X-Workspace-Key", testWorkspaceKey))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$", hasSize(greaterThanOrEqualTo(1))));
     }
@@ -125,16 +146,51 @@ class ExecutionControllerIntegrationTest {
                 ))
                 .build();
 
-        String responseJson = mockMvc.perform(post("/api/v1/environments")
+        mockMvc.perform(post("/api/v1/environments")
+                        .header("X-Workspace-Key", testWorkspaceKey)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(envDto)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.name").value("QA Test Env"))
                 .andExpect(jsonPath("$.isActive").value(true))
-                .andReturn().getResponse().getContentAsString();
+                .andExpect(jsonPath("$.variables[0].value").value("http://localhost:8080"))
+                .andExpect(jsonPath("$.variables[1].value").value("********"));
 
-        mockMvc.perform(get("/api/v1/environments/active"))
+        mockMvc.perform(get("/api/v1/environments/active")
+                        .header("X-Workspace-Key", testWorkspaceKey))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.name").value("QA Test Env"));
+                .andExpect(jsonPath("$.name").value("QA Test Env"))
+                .andExpect(jsonPath("$.variables[1].value").value("********"));
+    }
+
+    @Test
+    @DisplayName("CORS: Preflight request from allowed localhost origin should be accepted with credentials")
+    void testCorsAllowedOrigin() throws Exception {
+        mockMvc.perform(options("/api/v1/health")
+                        .header("Origin", "http://localhost:5173")
+                        .header("Access-Control-Request-Method", "GET"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Access-Control-Allow-Origin", "http://localhost:5173"))
+                .andExpect(header().string("Access-Control-Allow-Credentials", "true"));
+    }
+
+    @Test
+    @DisplayName("CORS: Request from unapproved arbitrary origin must be rejected without allow header")
+    void testCorsDisallowedOrigin() throws Exception {
+        mockMvc.perform(options("/api/v1/health")
+                        .header("Origin", "https://untrusted-third-party.com")
+                        .header("Access-Control-Request-Method", "GET"))
+                .andExpect(status().isForbidden())
+                .andExpect(header().doesNotExist("Access-Control-Allow-Origin"));
+    }
+
+    @Test
+    @DisplayName("CORS: Arbitrary pages.dev domains must NOT be accepted by default")
+    void testCorsArbitraryPagesDevBlockedByDefault() throws Exception {
+        mockMvc.perform(options("/api/v1/health")
+                        .header("Origin", "https://unauthorized-deployment.pages.dev")
+                        .header("Access-Control-Request-Method", "GET"))
+                .andExpect(status().isForbidden())
+                .andExpect(header().doesNotExist("Access-Control-Allow-Origin"));
     }
 }

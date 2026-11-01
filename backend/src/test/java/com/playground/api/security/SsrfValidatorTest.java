@@ -68,4 +68,35 @@ class SsrfValidatorTest {
         assertThrows(SsrfSecurityException.class, () -> validator.validateUrl("http://127.0.0.1:8080/api"));
         assertThrows(SsrfSecurityException.class, () -> validator.validateUrl("http://localhost:8080/api"));
     }
+
+    @Test
+    @DisplayName("Default PlaygroundSecurityProperties must permit loopback and private IPs for local development")
+    void testDefaultSecurityPropertiesAreLocalDevFriendly() {
+        PlaygroundSecurityProperties defaultProps = new PlaygroundSecurityProperties();
+        assertTrue(defaultProps.isAllowLoopback(), "Default allowLoopback must be true for local development");
+        assertTrue(defaultProps.isAllowPrivateIps(), "Default allowPrivateIps must be true for local development");
+    }
+
+    @Test
+    @DisplayName("Production strict mode (allowLoopback=false, allowPrivateIps=false) should block loopback and RFC 1918 private IPs")
+    void testProductionStrictModeBlocksLoopbackAndPrivateIps() {
+        PlaygroundSecurityProperties prodProps = new PlaygroundSecurityProperties();
+        prodProps.setAllowLoopback(false);
+        prodProps.setAllowPrivateIps(false);
+        SsrfValidator prodValidator = new SsrfValidator(prodProps);
+        assertThrows(SsrfSecurityException.class, () -> prodValidator.validateUrl("http://localhost:8080/api/v1/echo/get"));
+        assertThrows(SsrfSecurityException.class, () -> prodValidator.validateUrl("http://127.0.0.1:8080/api/v1/echo/get"));
+        assertThrows(SsrfSecurityException.class, () -> prodValidator.validateUrl("http://192.168.1.50:8080/api"));
+        assertThrows(SsrfSecurityException.class, () -> prodValidator.validateUrl("http://10.0.0.1:8080/api"));
+        assertThrows(SsrfSecurityException.class, () -> prodValidator.validateUrl("http://172.16.0.1:8080/api"));
+    }
+
+    @Test
+    @DisplayName("Should permit private IPs when allowPrivateIps is explicitly set to true")
+    void testPermitPrivateIpsWhenExplicitlyAllowed() {
+        properties.setAllowPrivateIps(true);
+        URI uri = validator.validateUrl("http://192.168.1.50:8080/api");
+        assertNotNull(uri);
+        assertEquals("192.168.1.50", uri.getHost());
+    }
 }
