@@ -32,6 +32,11 @@ public class WorkspaceInterceptor implements HandlerInterceptor {
         String path = request.getRequestURI();
         String method = request.getMethod();
 
+        // 0. Immediately allow CORS preflight (OPTIONS) requests
+        if ("OPTIONS".equalsIgnoreCase(method)) {
+            return true;
+        }
+
         // 1. Bypass public and documentation endpoints
         if (isPublicEndpoint(path, method)) {
             // Apply workspace creation rate limit to POST /api/v1/workspaces

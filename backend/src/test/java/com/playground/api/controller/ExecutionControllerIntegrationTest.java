@@ -193,4 +193,28 @@ class ExecutionControllerIntegrationTest {
                 .andExpect(status().isForbidden())
                 .andExpect(header().doesNotExist("Access-Control-Allow-Origin"));
     }
+
+    @Test
+    @DisplayName("CORS: Preflight OPTIONS request to /api/v1/workspaces succeeds with 200 OK without requiring workspace key")
+    void testCorsPreflightWorkspacesSucceeds() throws Exception {
+        mockMvc.perform(options("/api/v1/workspaces")
+                        .header("Origin", "http://localhost:5173")
+                        .header("Access-Control-Request-Method", "POST")
+                        .header("Access-Control-Request-Headers", "Content-Type,Authorization,X-Workspace-Key"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Access-Control-Allow-Origin", "http://localhost:5173"))
+                .andExpect(header().string("Access-Control-Allow-Credentials", "true"));
+    }
+
+    @Test
+    @DisplayName("CORS: Preflight OPTIONS request to /api/v1/execute succeeds with 200 OK without requiring workspace key")
+    void testCorsPreflightExecuteSucceeds() throws Exception {
+        mockMvc.perform(options("/api/v1/execute")
+                        .header("Origin", "http://localhost:5173")
+                        .header("Access-Control-Request-Method", "POST")
+                        .header("Access-Control-Request-Headers", "Content-Type,Authorization,X-Workspace-Key"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Access-Control-Allow-Origin", "http://localhost:5173"))
+                .andExpect(header().string("Access-Control-Allow-Credentials", "true"));
+    }
 }

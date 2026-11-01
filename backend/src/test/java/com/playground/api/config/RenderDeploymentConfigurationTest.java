@@ -122,6 +122,27 @@ class RenderDeploymentConfigurationTest {
     }
 
     @Test
+    @DisplayName("CORS Custom Configuration: Quotes and trailing slashes must be sanitized")
+    void testCorsSanitization() {
+        List<String> rawInputs = List.of(
+                "\"https://api-testing-playground-a36.pages.dev/\"",
+                "'http://localhost:5173/'"
+        );
+
+        CorsConfig config = new CorsConfig(rawInputs);
+        List<String> origins = config.getAllowedOrigins();
+
+        assertEquals(2, origins.size());
+        assertTrue(origins.contains("https://api-testing-playground-a36.pages.dev"));
+        assertTrue(origins.contains("http://localhost:5173"));
+        assertFalse(origins.contains("https://api-testing-playground-a36.pages.dev/"));
+
+        org.springframework.web.cors.CorsConfiguration corsConfig = config.createCorsConfiguration();
+        assertTrue(corsConfig.getAllowedMethods().containsAll(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")));
+        assertTrue(corsConfig.getAllowedHeaders().containsAll(List.of("Content-Type", "Authorization", "X-Workspace-Key")));
+    }
+
+    @Test
     @DisplayName("SSRF Defaults: application.yml must default allow-loopback and allow-private-ips to true for local development")
     void testApplicationYmlSsrfDefaults() throws Exception {
         ClassPathResource resource = new ClassPathResource("application.yml");
